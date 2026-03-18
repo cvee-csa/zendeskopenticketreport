@@ -11,7 +11,7 @@ Required environment variables:
     ZENDESK_TOKEN   Zendesk API token (Admin > Apps & Integrations > API)
 """
 
-import os, re, time, base64
+import os, re, time, base64, json
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
@@ -20,9 +20,21 @@ from openpyxl                import Workbook
 from openpyxl.styles         import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils          import get_column_letter
 
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
+
 # ── Credentials ────────────────────────────────────────────────────────────────
 ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
 ZENDESK_TOKEN = os.environ["ZENDESK_TOKEN"]
+
+# Google Drive upload (optional — set these secrets to enable)
+GDRIVE_SA_JSON  = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")  # full JSON key string
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")            # folder or Shared Drive folder ID
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ZENDESK_DOMAIN = "cloudsecurityalliance.zendesk.com"
@@ -50,6 +62,52 @@ DEADLINES = {
     "security.txt": datetime(2026, 4, 1, tzinfo=timezone.utc),
 }
 
+# ── Google Drive upload ────────────────────────────────────────────────────────
+def upload_to_gdrive(file_path):
+    """
+    Upload file_path to Google Drive (works with both My Drive and Shared Drives).
+    Requires GDRIVE_SERVICE_ACCOUNT_JSON and GDRIVE_FOLDER_ID env vars.
+    Skips silently if either is missing or google-auth libs are not installed.
+    """
+    if not GDRIVE_AVAILABLE:
+        print("  [Drive] google-auth libraries not installed — skipping upload.")
+        return
+    if not GDRIVE_SA_JSON or not GDRIVE_FOLDER_ID:
+        print("  [Drive] GDRIVE_SERVICE_ACCOUNT_JSON or GDRIVE_FOLDER_ID not set — skipping.")
+        return
+
+    try:
+        creds_info = json.loads(GDRIVE_SA_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        service = build("drive", "v3", credentials=creds)
+
+        file_name = os.path.basename(file_path)
+        file_metadata = {"name": file_name, "parents": [GDRIVE_FOLDER_ID]}
+        media = MediaFileUpload(
+            file_path,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=True,
+        )
+
+        # supportsAllDrives=True makes it work for both Shared Drives and My Drive
+        uploaded = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+
+        print(f"  [Drive] Uploaded: {uploaded['name']}")
+        print(f"  [Drive] View at : {uploaded.get('webViewLink', '(no link)')}")
+
+    except Exception as e:
+        print(f"  [Drive] Upload failed: {e}")
+        raise
+
+
 # ── Zendesk API helpers ─────────────────────────────────────────────────────────
 def _zd_headers():
     token = base64.b64encode(
@@ -58,46 +116,6 @@ def _zd_headers():
     return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
 
 
-def diagnose_groups():
-    """
-    Fetch all Zendesk groups and print their IDs + names.
-    Also runs a broad search to verify the API token's ticket visibility.
-    """
-    # ── Who am I? ────────────────────────────────────────────────────────────
-    me_r = requests.get(f"{BASE_ZD}/users/me.json", headers=_zd_headers(), timeout=30)
-    me_r.raise_for_status()
-    me = me_r.json().get("user", {})
-    print(f"  API token user : {me.get('name')} <{me.get('email')}>")
-    print(f"  Role           : {me.get('role')}")
-    print(f"  Ticket access  : {me.get('ticket_restriction', 'unknown')}")
-    print()
-
-    # ── Broad search sanity-check ─────────────────────────────────────────────
-    r = requests.get(
-        f"{BASE_ZD}/search.json",
-        headers=_zd_headers(),
-        params={"query": "type:ticket status:open", "per_page": 1},
-        timeout=30,
-    )
-    r.raise_for_status()
-    broad = r.json()
-    print(f"  Broad search 'type:ticket status:open' → count={broad.get('count', '?')}")
-    print()
-
-    # ── Group listing ─────────────────────────────────────────────────────────
-    print("  --- Zendesk groups in this account ---")
-    url = f"{BASE_ZD}/groups.json?per_page=100"
-    while url:
-        r = requests.get(url, headers=_zd_headers(), timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        for g in data.get("groups", []):
-            match = " ✓ MATCHED" if g["id"] in IT_OPS_GROUPS else ""
-            print(f"    id={g['id']}  name={g['name']}{match}")
-        url = data.get("next_page")
-    print("  ---")
-    print(f"  Hardcoded IT_OPS_GROUPS IDs: {list(IT_OPS_GROUPS.keys())}")
-    print()
 
 
 def fetch_tickets():
@@ -450,9 +468,6 @@ def main():
     print(f"IT Ops Tag Report — {TODAY}")
     print(f"{'='*60}\n")
 
-    print("[ 0/3 ] Verifying Zendesk group IDs...")
-    diagnose_groups()
-
     print("[ 1/3 ] Fetching Zendesk tickets...")
     tickets = fetch_tickets()
 
@@ -501,6 +516,10 @@ def main():
     print("[ 3/3 ] Building spreadsheet...")
     esc_n, rarc_n, ryan_n = build_spreadsheet(rows)
     print(f"  Report: {REPORT_PATH}")
+
+    print("[ + ] Uploading to Google Drive...")
+    upload_to_gdrive(REPORT_PATH)
+
     print(f"\nDone. {len(rows)} tickets reported.\n")
 
 
