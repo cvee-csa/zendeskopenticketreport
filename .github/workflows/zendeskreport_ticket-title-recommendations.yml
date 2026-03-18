@@ -1,4 +1,4 @@
-name: IT Ops Zendesk Title Editor
+name: Zendesk Report for Ticket Title Recommendations
 
 on:
   # Run manually from the Actions tab whenever needed

@@ -1,4 +1,4 @@
-name: IT Ops Morning Tag Report
+name:  Zendesk Report for ESC/RARC Open Tickets 
 
 on:
   schedule:
