@@ -80,36 +80,48 @@ def diagnose_groups():
 
 def fetch_tickets():
     """
-    Fetch open/pending/on-hold tickets from the three IT Ops groups using the
-    Search API, avoiding the 10,000-result offset-pagination limit.
+    Fetch open/pending/on-hold tickets from each IT Ops group using one Search
+    API query per group.  Querying groups individually avoids the Zendesk Search
+    API's unreliable handling of nested OR conditions (group_id:X OR group_id:Y).
     """
-    group_clause  = " OR ".join(f"group_id:{gid}" for gid in IT_OPS_GROUPS)
-    status_clause = "status:open OR status:pending OR status:hold"
-    query = f"type:ticket ({status_clause}) ({group_clause})"
+    tickets  = []
+    seen_ids = set()
 
-    print(f"  Search query: {query}")
+    for gid, gname in IT_OPS_GROUPS.items():
+        query = (
+            f"type:ticket "
+            f"(status:open OR status:pending OR status:hold) "
+            f"group_id:{gid}"
+        )
+        print(f"  Querying group '{gname}' (id={gid})...")
+        print(f"  Search query: {query}")
 
-    tickets = []
-    url = f"{BASE_ZD}/search.json?" + urlencode({
-        "query":      query,
-        "per_page":   100,
-        "sort_by":    "updated_at",
-        "sort_order": "desc",
-    })
+        url = f"{BASE_ZD}/search.json?" + urlencode({
+            "query":      query,
+            "per_page":   100,
+            "sort_by":    "updated_at",
+            "sort_order": "desc",
+        })
 
-    page = 1
-    while url:
-        r = requests.get(url, headers=_zd_headers(), timeout=30)
-        if r.status_code == 429:
-            time.sleep(float(r.headers.get("Retry-After", 10)))
-            continue
-        r.raise_for_status()
-        data = r.json()
-        page_results = data.get("results", [])
-        tickets.extend(page_results)
-        print(f"  Page {page}: {len(page_results)} results (total so far: {len(tickets)})")
-        url = data.get("next_page")
-        page += 1
+        page        = 1
+        group_count = 0
+        while url:
+            r = requests.get(url, headers=_zd_headers(), timeout=30)
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 10)))
+                continue
+            r.raise_for_status()
+            data         = r.json()
+            page_results = data.get("results", [])
+            new_tickets  = [t for t in page_results if t["id"] not in seen_ids]
+            for t in new_tickets:
+                seen_ids.add(t["id"])
+                tickets.append(t)
+            group_count += len(new_tickets)
+            print(f"    Page {page}: {len(page_results)} results, {len(new_tickets)} new")
+            url   = data.get("next_page")
+            page += 1
+        print(f"  → {group_count} tickets from '{gname}'")
 
     print(f"\n  --- Sample of fetched tickets (first 5) ---")
     for t in tickets[:5]:
@@ -117,7 +129,7 @@ def fetch_tickets():
               f"assignee_id={t.get('assignee_id')} | status={t.get('status')} | "
               f"subject={t.get('subject','')[:60]}")
     if not tickets:
-        print("  WARNING: Search returned 0 tickets — group IDs likely don't match.")
+        print("  WARNING: 0 tickets found across all groups — check API token permissions.")
     print(f"  ---\n")
 
     print(f"  Fetched {len(tickets)} IT Ops open/pending/on-hold tickets")
