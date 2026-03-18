@@ -26,8 +26,8 @@ jobs:
           ZENDESK_TOKEN:               ${{ secrets.ZENDESK_TOKEN }}
           ANTHROPIC_API_KEY:           ${{ secrets.ANTHROPIC_API_KEY }}
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          GDRIVE_FOLDER_ID:            ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: python suggest_titles.py
+          GDRIVE_FOLDER_ID_TITLES:     ${{ secrets.GDRIVE_FOLDER_ID_TITLES }}
+        run: python zendeskreport_opentickets_ticket-title-rename.py
 
       - name: Upload report as artifact
         uses: actions/upload-artifact@v4

@@ -44,7 +44,7 @@ jobs:
           # GMAIL_FROM:         ${{ secrets.GMAIL_FROM }}
           # GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           # GMAIL_TO:           ${{ secrets.GMAIL_TO }}
-        run: python morning_report.py
+        run: python zendeskreport_opentickets_esc-rarc_bidaily.py
 
       - name: Upload report as artifact
         uses: actions/upload-artifact@v4
