@@ -12,6 +12,7 @@ on:
 jobs:
   generate-report:
     runs-on: ubuntu-latest
+    environment: prod
 
     steps:
       - name: Check out repository
