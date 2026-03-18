@@ -30,6 +30,7 @@ jobs:
         env:
           ZENDESK_EMAIL: ${{ secrets.ZENDESK_EMAIL }}
           ZENDESK_TOKEN: ${{ secrets.ZENDESK_TOKEN }}
+          environment: prod
           # Email is optional — add these secrets later to enable delivery
           # GMAIL_FROM:         ${{ secrets.GMAIL_FROM }}
           # GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
