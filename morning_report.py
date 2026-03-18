@@ -41,7 +41,8 @@ ZENDESK_DOMAIN = "cloudsecurityalliance.zendesk.com"
 BASE_ZD        = f"https://{ZENDESK_DOMAIN}/api/v2"
 TICKET_URL     = f"https://{ZENDESK_DOMAIN}/agent/tickets/"
 TODAY          = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-REPORT_PATH    = f"/tmp/IT_Ops_Tag_Report_{TODAY}.xlsx"
+NOW            = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+REPORT_PATH    = f"/tmp/IT_Ops_Tag_Report_{NOW}.xlsx"
 
 IT_OPS_GROUPS = {
     7783360594455:  "IT-Operations",
