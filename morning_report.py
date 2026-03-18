@@ -82,10 +82,25 @@ def upload_to_gdrive(file_path):
             print("  [Drive] GDRIVE_SERVICE_ACCOUNT_JSON is blank after stripping whitespace — skipping.")
             return
         creds_info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
+
+        # Support both service account keys and OAuth user credentials
+        if creds_info.get("type") == "service_account":
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info,
+                scopes=["https://www.googleapis.com/auth/drive"],
+            )
+        else:
+            # OAuth user credentials (from get_token.py / InstalledAppFlow)
+            from google.oauth2.credentials import Credentials
+            creds = Credentials(
+                token=creds_info.get("token"),
+                refresh_token=creds_info["refresh_token"],
+                token_uri=creds_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+                client_id=creds_info["client_id"],
+                client_secret=creds_info["client_secret"],
+                scopes=creds_info.get("scopes"),
+            )
+
         service = build("drive", "v3", credentials=creds)
 
         file_name = os.path.basename(file_path)
