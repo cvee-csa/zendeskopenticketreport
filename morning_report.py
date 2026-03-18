@@ -4,18 +4,11 @@ IT Ops Zendesk Tag Report — morning_report.py
 
 Pulls all open/pending/on-hold tickets from the three IT Ops Zendesk groups,
 applies esc/rarc heuristics, and generates a colour-coded Excel report.
-
-Email sending is optional — the report is always saved as an artifact in
-GitHub Actions. Set the GMAIL_* environment variables to enable email delivery.
+The report is uploaded as a GitHub Actions artifact.
 
 Required environment variables:
-    ZENDESK_EMAIL        your Zendesk login email
-    ZENDESK_TOKEN        Zendesk API token (Admin > Apps & Integrations > API)
-
-Optional (for email delivery):
-    GMAIL_FROM           sender Gmail address
-    GMAIL_APP_PASSWORD   Gmail App Password
-    GMAIL_TO             recipient email(s), comma-separated
+    ZENDESK_EMAIL   your Zendesk login email
+    ZENDESK_TOKEN   Zendesk API token (Admin > Apps & Integrations > API)
 """
 
 import os, re, time, base64
@@ -28,14 +21,8 @@ from openpyxl.styles         import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils          import get_column_letter
 
 # ── Credentials ────────────────────────────────────────────────────────────────
-ZENDESK_EMAIL  = os.environ["ZENDESK_EMAIL"]
-ZENDESK_TOKEN  = os.environ["ZENDESK_TOKEN"]
-
-# Email is optional — only used if all three vars are set
-GMAIL_FROM     = os.environ.get("GMAIL_FROM", "")
-GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-GMAIL_TO       = os.environ.get("GMAIL_TO", "")
-EMAIL_ENABLED  = all([GMAIL_FROM, GMAIL_PASSWORD, GMAIL_TO])
+ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
+ZENDESK_TOKEN = os.environ["ZENDESK_TOKEN"]
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ZENDESK_DOMAIN = "cloudsecurityalliance.zendesk.com"
@@ -59,7 +46,6 @@ IT_OPS_ASSIGNEES = {
 RYAN_ID = 396710941733
 KURT_ID = 396693552053
 
-# Upcoming deadlines — keyword in ticket text → deadline date
 DEADLINES = {
     "security.txt": datetime(2026, 4, 1, tzinfo=timezone.utc),
 }
@@ -72,15 +58,36 @@ def _zd_headers():
     return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
 
 
+def diagnose_groups():
+    """
+    Fetch all Zendesk groups and print their IDs + names.
+    Used to verify the hardcoded IT_OPS_GROUPS IDs are correct.
+    """
+    print("  --- Zendesk groups in this account ---")
+    url = f"{BASE_ZD}/groups.json?per_page=100"
+    while url:
+        r = requests.get(url, headers=_zd_headers(), timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for g in data.get("groups", []):
+            match = " ✓ MATCHED" if g["id"] in IT_OPS_GROUPS else ""
+            print(f"    id={g['id']}  name={g['name']}{match}")
+        url = data.get("next_page")
+    print("  ---")
+    print(f"  Hardcoded IT_OPS_GROUPS IDs: {list(IT_OPS_GROUPS.keys())}")
+    print()
+
+
 def fetch_tickets():
     """
     Fetch open/pending/on-hold tickets from the three IT Ops groups using the
-    Search API. This avoids the 10,000-result (100-page) limit of the offset-based
-    /tickets.json endpoint by filtering directly at query time.
+    Search API, avoiding the 10,000-result offset-pagination limit.
     """
     group_clause  = " OR ".join(f"group_id:{gid}" for gid in IT_OPS_GROUPS)
     status_clause = "status:open OR status:pending OR status:hold"
     query = f"type:ticket ({status_clause}) ({group_clause})"
+
+    print(f"  Search query: {query}")
 
     tickets = []
     url = f"{BASE_ZD}/search.json?" + urlencode({
@@ -90,6 +97,7 @@ def fetch_tickets():
         "sort_order": "desc",
     })
 
+    page = 1
     while url:
         r = requests.get(url, headers=_zd_headers(), timeout=30)
         if r.status_code == 429:
@@ -97,8 +105,20 @@ def fetch_tickets():
             continue
         r.raise_for_status()
         data = r.json()
-        tickets.extend(data.get("results", []))
+        page_results = data.get("results", [])
+        tickets.extend(page_results)
+        print(f"  Page {page}: {len(page_results)} results (total so far: {len(tickets)})")
         url = data.get("next_page")
+        page += 1
+
+    print(f"\n  --- Sample of fetched tickets (first 5) ---")
+    for t in tickets[:5]:
+        print(f"    #{t['id']} | group_id={t.get('group_id')} | "
+              f"assignee_id={t.get('assignee_id')} | status={t.get('status')} | "
+              f"subject={t.get('subject','')[:60]}")
+    if not tickets:
+        print("  WARNING: Search returned 0 tickets — group IDs likely don't match.")
+    print(f"  ---\n")
 
     print(f"  Fetched {len(tickets)} IT Ops open/pending/on-hold tickets")
     return tickets
@@ -163,7 +183,6 @@ def classify(ticket, comments):
 
     it_ops_comments = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
 
-    # RARC: last IT Ops comment asks for confirmation and requester hasn't replied
     if it_ops_comments:
         last_itops     = it_ops_comments[-1]
         last_itops_idx = next(
@@ -179,7 +198,6 @@ def classify(ticket, comments):
                 "no requester reply yet."
             )
 
-    # ESC: keyword match or on-hold
     all_text = " ".join(
         [ticket.get("subject") or "", ticket.get("description") or ""]
         + [c.get("body", "") for c in comments]
@@ -386,92 +404,21 @@ def build_spreadsheet(rows):
     return esc_n, rarc_n, ryan_n
 
 
-# ── Email sender (optional) ─────────────────────────────────────────────────────
-def send_email(rows, esc_n, rarc_n, ryan_n):
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.base      import MIMEBase
-    from email.mime.text      import MIMEText
-    from email                import encoders
-
-    recipients = [r.strip() for r in GMAIL_TO.split(",")]
-
-    def row_html(r):
-        tag_style = (
-            "background:#FFE8E8;color:#C0392B;font-weight:bold" if r["tag"] == "esc"
-            else "background:#E8F4E8;color:#27AE60;font-weight:bold"
-        )
-        step = r["ryan_step"] or "—"
-        return (
-            f"<tr>"
-            f"<td style='{tag_style};padding:6px 10px;border:1px solid #ddd'>{r['tag']}</td>"
-            f"<td style='padding:6px 10px;border:1px solid #ddd'>"
-            f"<a href='{TICKET_URL}{r['ticket_id']}'>#{r['ticket_id']}</a></td>"
-            f"<td style='padding:6px 10px;border:1px solid #ddd'>{r['group']}</td>"
-            f"<td style='padding:6px 10px;border:1px solid #ddd'>{r['subject']}</td>"
-            f"<td style='padding:6px 10px;border:1px solid #ddd;font-size:12px'>{step}</td>"
-            f"</tr>"
-        )
-
-    table_rows = "\n".join(row_html(r) for r in rows)
-    html = f"""<html><body style="font-family:Arial,sans-serif;color:#222">
-<h2 style="color:#1F2D3D">IT Ops Tag Report — {TODAY}</h2>
-<p>
-  <strong style="color:#C0392B">{esc_n} esc</strong> &nbsp;|&nbsp;
-  <strong style="color:#27AE60">{rarc_n} rarc</strong> &nbsp;|&nbsp;
-  <strong style="color:#BF360C">{ryan_n} Ryan bottlenecks</strong>
-</p>
-<table style="border-collapse:collapse;width:100%;font-size:13px">
-  <thead>
-    <tr style="background:#1F2D3D;color:#fff">
-      <th style="padding:8px 10px">Tag</th>
-      <th style="padding:8px 10px">Ticket</th>
-      <th style="padding:8px 10px">Group</th>
-      <th style="padding:8px 10px">Subject</th>
-      <th style="padding:8px 10px">Ryan Escalation</th>
-    </tr>
-  </thead>
-  <tbody>{table_rows}</tbody>
-</table>
-<p style="color:#888;font-size:12px;margin-top:20px">
-  Full report attached as .xlsx — generated automatically via GitHub Actions.
-</p>
-</body></html>"""
-
-    msg            = MIMEMultipart()
-    msg["From"]    = GMAIL_FROM
-    msg["To"]      = ", ".join(recipients)
-    msg["Subject"] = f"IT Ops Tag Report — {TODAY} ({esc_n} esc, {rarc_n} rarc)"
-    msg.attach(MIMEText(html, "html"))
-
-    with open(REPORT_PATH, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    part.add_header(
-        "Content-Disposition",
-        f'attachment; filename="IT_Ops_Tag_Report_{TODAY}.xlsx"',
-    )
-    msg.attach(part)
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(GMAIL_FROM, GMAIL_PASSWORD)
-        smtp.sendmail(GMAIL_FROM, recipients, msg.as_string())
-
-    print(f"  Email sent → {', '.join(recipients)}")
-
-
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main():
     print(f"\n{'='*60}")
     print(f"IT Ops Tag Report — {TODAY}")
     print(f"{'='*60}\n")
 
+    print("[ 0/3 ] Verifying Zendesk group IDs...")
+    diagnose_groups()
+
     print("[ 1/3 ] Fetching Zendesk tickets...")
     tickets = fetch_tickets()
 
     print(f"[ 2/3 ] Analysing {len(tickets)} tickets...")
     rows = []
+    skipped = 0
     for idx, ticket in enumerate(tickets, 1):
         tid = ticket["id"]
         print(f"  {idx}/{len(tickets)} — #{tid}", end="\r")
@@ -479,6 +426,7 @@ def main():
         comments    = fetch_comments(tid)
         tag, reason = classify(ticket, comments)
         if not tag:
+            skipped += 1
             continue
 
         group_id = ticket.get("group_id")
@@ -507,19 +455,12 @@ def main():
     rows.sort(key=lambda r: (0 if r["tag"] == "esc" else 1, r["group"]))
     esc_count  = sum(1 for r in rows if r["tag"] == "esc")
     rarc_count = sum(1 for r in rows if r["tag"] == "rarc")
-    print(f"\n  {len(rows)} candidates — {esc_count} esc, {rarc_count} rarc")
+    print(f"\n  {len(rows)} candidates — {esc_count} esc, {rarc_count} rarc "
+          f"({skipped} tickets did not match esc/rarc criteria)")
 
     print("[ 3/3 ] Building spreadsheet...")
     esc_n, rarc_n, ryan_n = build_spreadsheet(rows)
-    print(f"\n  Report path: {REPORT_PATH}")
-
-    if EMAIL_ENABLED:
-        print("[ +   ] Sending email...")
-        send_email(rows, esc_n, rarc_n, ryan_n)
-    else:
-        print("[ --  ] Email skipped (GMAIL_* vars not set)")
-        print("        Download the report from the GitHub Actions artifacts tab.")
-
+    print(f"  Report: {REPORT_PATH}")
     print(f"\nDone. {len(rows)} tickets reported.\n")
 
 
