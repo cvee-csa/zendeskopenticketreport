@@ -12,7 +12,7 @@ Required environment variables:
 """
 
 import os, re, time, base64
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import requests
@@ -61,8 +61,30 @@ def _zd_headers():
 def diagnose_groups():
     """
     Fetch all Zendesk groups and print their IDs + names.
-    Used to verify the hardcoded IT_OPS_GROUPS IDs are correct.
+    Also runs a broad search to verify the API token's ticket visibility.
     """
+    # ── Who am I? ────────────────────────────────────────────────────────────
+    me_r = requests.get(f"{BASE_ZD}/users/me.json", headers=_zd_headers(), timeout=30)
+    me_r.raise_for_status()
+    me = me_r.json().get("user", {})
+    print(f"  API token user : {me.get('name')} <{me.get('email')}>")
+    print(f"  Role           : {me.get('role')}")
+    print(f"  Ticket access  : {me.get('ticket_restriction', 'unknown')}")
+    print()
+
+    # ── Broad search sanity-check ─────────────────────────────────────────────
+    r = requests.get(
+        f"{BASE_ZD}/search.json",
+        headers=_zd_headers(),
+        params={"query": "type:ticket status:open", "per_page": 1},
+        timeout=30,
+    )
+    r.raise_for_status()
+    broad = r.json()
+    print(f"  Broad search 'type:ticket status:open' → count={broad.get('count', '?')}")
+    print()
+
+    # ── Group listing ─────────────────────────────────────────────────────────
     print("  --- Zendesk groups in this account ---")
     url = f"{BASE_ZD}/groups.json?per_page=100"
     while url:
@@ -80,59 +102,65 @@ def diagnose_groups():
 
 def fetch_tickets():
     """
-    Fetch open/pending/on-hold tickets from each IT Ops group using one Search
-    API query per group.  Querying groups individually avoids the Zendesk Search
-    API's unreliable handling of nested OR conditions (group_id:X OR group_id:Y).
+    Fetch IT Ops open/pending/hold tickets using the cursor-based incremental
+    export API (/api/v2/incremental/tickets/cursor.json).
+
+    Unlike the Search API, the incremental endpoint:
+      - Has no result-count cap
+      - Is not subject to per-agent ticket-visibility restrictions
+      - Is the same approach used by the proven export_tickets.py script
+
+    We pull all tickets updated in the last LOOKBACK_DAYS days, then filter
+    locally to IT Ops groups + open/pending/hold status.
     """
-    tickets  = []
-    seen_ids = set()
+    LOOKBACK_DAYS = 60
+    since = int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp())
+    print(f"  Using incremental cursor export (last {LOOKBACK_DAYS} days, since={since})")
 
-    for gid, gname in IT_OPS_GROUPS.items():
-        query = (
-            f"type:ticket "
-            f"(status:open OR status:pending OR status:hold) "
-            f"group_id:{gid}"
-        )
-        print(f"  Querying group '{gname}' (id={gid})...")
-        print(f"  Search query: {query}")
+    url        = f"{BASE_ZD}/incremental/tickets/cursor.json?start_time={since}"
+    all_tickets = []
+    batch       = 1
 
-        url = f"{BASE_ZD}/search.json?" + urlencode({
-            "query":      query,
-            "per_page":   100,
-            "sort_by":    "updated_at",
-            "sort_order": "desc",
-        })
+    while url:
+        r = requests.get(url, headers=_zd_headers(), timeout=60)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 60)))
+            continue
+        r.raise_for_status()
+        data          = r.json()
+        batch_tickets = data.get("tickets", [])
+        all_tickets.extend(batch_tickets)
+        print(f"  Batch {batch}: {len(batch_tickets)} tickets (running total: {len(all_tickets)})")
 
-        page        = 1
-        group_count = 0
-        while url:
-            r = requests.get(url, headers=_zd_headers(), timeout=30)
-            if r.status_code == 429:
-                time.sleep(float(r.headers.get("Retry-After", 10)))
-                continue
-            r.raise_for_status()
-            data         = r.json()
-            page_results = data.get("results", [])
-            new_tickets  = [t for t in page_results if t["id"] not in seen_ids]
-            for t in new_tickets:
-                seen_ids.add(t["id"])
-                tickets.append(t)
-            group_count += len(new_tickets)
-            print(f"    Page {page}: {len(page_results)} results, {len(new_tickets)} new")
-            url   = data.get("next_page")
-            page += 1
-        print(f"  → {group_count} tickets from '{gname}'")
+        if data.get("end_of_stream", False):
+            break
+        after_url = data.get("after_url")
+        if not after_url or after_url == url:
+            break
+        url    = after_url
+        batch += 1
+        time.sleep(0.5)
 
+    # Filter locally to IT Ops groups + actionable statuses
+    it_ops_ids     = set(IT_OPS_GROUPS.keys())
+    target_statuses = {"open", "pending", "hold"}
+    tickets = [
+        t for t in all_tickets
+        if t.get("group_id") in it_ops_ids
+        and t.get("status") in target_statuses
+    ]
+
+    print(f"\n  Total from API  : {len(all_tickets)} tickets")
+    print(f"  After filtering : {len(tickets)} IT Ops open/pending/hold tickets")
     print(f"\n  --- Sample of fetched tickets (first 5) ---")
     for t in tickets[:5]:
-        print(f"    #{t['id']} | group_id={t.get('group_id')} | "
-              f"assignee_id={t.get('assignee_id')} | status={t.get('status')} | "
-              f"subject={t.get('subject','')[:60]}")
+        print(f"    #{t['id']} | group={IT_OPS_GROUPS.get(t.get('group_id'), t.get('group_id'))} | "
+              f"status={t.get('status')} | subject={t.get('subject','')[:60]}")
     if not tickets:
-        print("  WARNING: 0 tickets found across all groups — check API token permissions.")
+        print("  WARNING: 0 IT Ops tickets found after filtering.")
+        print(f"  (API returned {len(all_tickets)} total tickets in the window)")
     print(f"  ---\n")
 
-    print(f"  Fetched {len(tickets)} IT Ops open/pending/on-hold tickets")
     return tickets
 
 
