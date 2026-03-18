@@ -251,11 +251,52 @@ RARC_PATTERNS = [
 ]
 
 
+# Human-readable descriptions for each pattern
+ESC_REASONS = {
+    r"blocked\s+on":                                          "Ticket is blocked waiting on someone",
+    r"waiting\s+on\s+(ryan|kurt|dev|r&d|leadership)":        "Waiting on Ryan / Kurt / Dev / Leadership",
+    r"need[s]?\s+(ryan|kurt|dev|leadership|r&d|approval)":   "Needs input or approval from Ryan / Kurt / Dev / Leadership",
+    r"(ryan|kurt)\s+(need[s]?|has\s+to|must|should|is\s+required)": "Action required from Ryan or Kurt",
+    r"pending\s+(ryan|kurt|dev|leadership|r&d|approval)":    "Pending action or approval from Ryan / Kurt / Dev / Leadership",
+    r"requires?\s+(ryan|kurt|dev|leadership|approval)":      "Requires input or approval",
+    r"escalat":                                               "Ticket has been escalated",
+    r"business\s+decision":                                  "Awaiting a business decision",
+    r"leadership\s+decision":                                "Awaiting a leadership decision",
+    r"waiting\s+for\s+(a\s+)?(response|decision|approval|review)": "Waiting for a response, decision, or approval",
+    r"no\s+response\s+(from|since)":                         "No response has been received",
+    r"ryan\s+bergsma":                                       "Ryan Bergsma is mentioned in the ticket",
+    r"kurt\s+seigfried":                                     "Kurt Seigfried is mentioned in the ticket",
+}
+
+RARC_REASONS = {
+    r"can\s+you\s+confirm":                                  "IT Ops asked the requester to confirm",
+    r"please\s+confirm":                                     "IT Ops asked the requester to confirm",
+    r"let\s+me\s+know\s+if":                                 "IT Ops is awaiting feedback from the requester",
+    r"does\s+this\s+(work|look\s+right|meet)":              "IT Ops asked if the issue has been resolved",
+    r"is\s+this\s+satisfactory":                             "IT Ops asked if the resolution is satisfactory",
+    r"can\s+we\s+(go\s+ahead\s+and\s+)?close":              "IT Ops asked to close the ticket",
+    r"please\s+verify":                                      "IT Ops asked the requester to verify",
+    r"good\s+to\s+(go|close)":                               "IT Ops indicated the ticket is ready to close",
+    r"everything\s+(look|work|seem)\s+(good|ok|right)":      "IT Ops asked if everything looks good",
+    r"(ticket|this)\s+can\s+be\s+closed":                   "IT Ops indicated the ticket can be closed",
+    r"let\s+us\s+know\s+when":                               "IT Ops is awaiting confirmation from the requester",
+    r"confirm.*and\s+(we|i)\s+(will|can|shall)\s+close":    "IT Ops is waiting to close pending requester confirmation",
+}
+
+
 def _match_any(patterns, text):
+    """Return (pattern, snippet) for the first matching pattern, or (None, None)."""
     for p in patterns:
-        if re.search(p, text, re.IGNORECASE):
-            return p
-    return None
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            # Extract a short snippet of surrounding context (up to 80 chars)
+            start = max(0, m.start() - 20)
+            end   = min(len(text), m.end() + 40)
+            snippet = text[start:end].replace("\n", " ").strip()
+            if len(snippet) > 80:
+                snippet = snippet[:77] + "..."
+            return p, snippet
+    return None, None
 
 
 def classify(ticket, comments):
@@ -272,20 +313,19 @@ def classify(ticket, comments):
         subsequent        = comments[last_itops_idx + 1:]
         requester_id      = ticket.get("requester_id")
         requester_replied = any(c.get("author_id") == requester_id for c in subsequent)
-        matched = _match_any(RARC_PATTERNS, last_itops.get("body", ""))
+        matched, snippet  = _match_any(RARC_PATTERNS, last_itops.get("body", ""))
         if matched and not requester_replied:
-            return "rarc", (
-                f"IT Ops asked for confirmation (matched: '{matched}'); "
-                "no requester reply yet."
-            )
+            description = RARC_REASONS.get(matched, "IT Ops awaiting requester reply")
+            return "rarc", f"{description}. No reply from requester yet.\n\u201c{snippet}\u201d"
 
     all_text = " ".join(
         [ticket.get("subject") or "", ticket.get("description") or ""]
         + [c.get("body", "") for c in comments]
     )
-    matched = _match_any(ESC_PATTERNS, all_text)
+    matched, snippet = _match_any(ESC_PATTERNS, all_text)
     if matched:
-        return "esc", f"Blocked on external actor (matched: '{matched}')."
+        description = ESC_REASONS.get(matched, "Blocked on external actor")
+        return "esc", f"{description}.\n\u201c{snippet}\u201d"
 
     if status == "on-hold":
         return "esc", "Ticket is on-hold — pending external action or decision."
