@@ -368,6 +368,15 @@ def ryan_escalation(ticket, comments):
 
 
 # ── Automated action description ────────────────────────────────────────────────
+def _comment_preview(comment, max_chars=150):
+    """Return a short, clean excerpt from a comment body."""
+    body = (comment.get("plain_body") or comment.get("body") or "").strip()
+    body = re.sub(r"\s+", " ", body)          # collapse whitespace/newlines
+    if len(body) > max_chars:
+        body = body[:max_chars - 1].rstrip() + "…"
+    return body
+
+
 def automated_action(tag, ryan_step, ticket, comments):
     subj     = (ticket.get("subject") or "").lower()
     all_text = " ".join(
@@ -375,46 +384,74 @@ def automated_action(tag, ryan_step, ticket, comments):
         + [c.get("body", "") for c in comments]
     ).lower()
 
+    # ── Gather last internal note and last public reply from IT Ops ──────────
+    it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
+    last_internal = next((c for c in reversed(it_ops_cmts) if not c.get("public", True)), None)
+    last_public   = next((c for c in reversed(it_ops_cmts) if c.get("public", True)),  None)
+
+    context_lines = []
+    if last_internal:
+        date    = (last_internal.get("created_at") or "")[:10]
+        author  = IT_OPS_ASSIGNEES.get(last_internal.get("author_id"), "IT Ops")
+        preview = _comment_preview(last_internal)
+        context_lines.append(f"[Internal note — {author}, {date}]\n\"{preview}\"")
+    if last_public:
+        date    = (last_public.get("created_at") or "")[:10]
+        author  = IT_OPS_ASSIGNEES.get(last_public.get("author_id"), "IT Ops")
+        preview = _comment_preview(last_public)
+        context_lines.append(f"[Public reply — {author}, {date}]\n\"{preview}\"")
+
+    context = "\n".join(context_lines)
+
+    # ── Decide action steps based on tag / escalation state ──────────────────
     if tag == "rarc":
-        return (
-            "get_ticket_comments → check for requester reply. "
-            "If no reply in 3 days: create_ticket_comment with follow-up. "
-            "If no reply in 7 days: update_ticket → solved."
+        steps = (
+            "1. get_ticket_comments → confirm no requester reply since last IT Ops message.\n"
+            "2. If no reply within 3 days: create_ticket_comment (public reply) — send a friendly follow-up asking if the issue is resolved.\n"
+            "3. If no reply within 7 days: update_ticket → status = solved, with closing note."
         )
-    if ryan_step == "Tag Ryan in ticket":
-        return (
-            "create_ticket_comment @mentioning Ryan Bergsma with specific ask. "
-            "Poll get_ticket_comments; if no ack after 48 h, post URL to Slack #internal."
+    elif ryan_step == "Tag Ryan in ticket":
+        steps = (
+            "1. create_ticket_comment (internal note) — @mention Ryan Bergsma with a specific ask referencing the blocked item.\n"
+            "2. get_ticket_comments after 48 h — if no acknowledgement: post ticket URL + context to Slack #internal."
         )
-    if ryan_step == "Slack #internal":
-        return (
-            "Navigate Chrome → Slack #internal. Post ticket URL + blocked-status summary. "
-            "Log outreach as Zendesk comment."
+    elif ryan_step == "Slack #internal":
+        steps = (
+            "1. Open Slack → post in #internal: ticket URL + one-line summary of what is blocked and why.\n"
+            "2. create_ticket_comment (internal note) — log outreach date and exact message posted."
         )
-    if ryan_step and "directly" in ryan_step and "expires" in ryan_step:
-        return (
-            "DM Ryan Bergsma AND Kurt Seigfried on Slack with ticket URL + deadline countdown. "
-            "Post to Slack #internal. Log all outreaches as Zendesk comment."
+    elif ryan_step and "directly" in ryan_step and "expires" in ryan_step:
+        steps = (
+            "1. Send Slack DM to Ryan Bergsma: ticket URL + deadline countdown + specific ask.\n"
+            "2. Send Slack DM to Kurt Seigfried with the same context.\n"
+            "3. Post to Slack #internal referencing both DMs.\n"
+            "4. create_ticket_comment (internal note) — log all outreach dates and messages sent."
         )
-    if ryan_step == "Slack Ryan directly":
-        return (
-            "Send Slack DM to Ryan Bergsma with ticket URL and specific ask. "
-            "Add Zendesk comment recording outreach date and message."
+    elif ryan_step == "Slack Ryan directly":
+        steps = (
+            "1. Send Slack DM to Ryan Bergsma: ticket URL + specific ask.\n"
+            "2. create_ticket_comment (internal note) — record outreach date and full message sent."
         )
-    if "kurt" in all_text or "seigfried" in all_text:
-        return (
-            "create_ticket_comment @mentioning Kurt Seigfried with specific ask. "
-            "If no ack in 48 h: post ticket URL to Slack #internal."
+    elif "kurt" in all_text or "seigfried" in all_text:
+        steps = (
+            "1. create_ticket_comment (internal note) — @mention Kurt Seigfried with specific ask.\n"
+            "2. If no acknowledgement within 48 h: post ticket URL to Slack #internal."
         )
-    if any(w in subj for w in ("dev", "code", "workflow", "broken", "fix")):
-        return (
-            "get_ticket to fetch linked Dev ticket + get_ticket_comments for status. "
-            "Post update comment. If Dev ticket idle > 5 days: post to Slack #internal."
+    elif any(w in subj for w in ("dev", "code", "workflow", "broken", "fix")):
+        steps = (
+            "1. get_ticket → retrieve linked Dev ticket; get_ticket_comments for current status.\n"
+            "2. create_ticket_comment (public reply) — post status update to requester.\n"
+            "3. If Dev ticket has been idle > 5 days: post to Slack #internal with ticket URL."
         )
-    return (
-        "get_ticket_comments to review thread. "
-        "create_ticket_comment with status update or next-step follow-up."
-    )
+    else:
+        steps = (
+            "1. get_ticket_comments → review full thread to identify next actionable step.\n"
+            "2. create_ticket_comment (public reply or internal note) — post status update or follow-up."
+        )
+
+    if context:
+        return f"{context}\n\n{steps}"
+    return steps
 
 
 # ── Spreadsheet builder ─────────────────────────────────────────────────────────
@@ -507,7 +544,7 @@ def build_spreadsheet(rows):
             _cell(ws, i, 8, "", bg=main_bg, align="center")
 
         _cell(ws, i, 9, r["auto_action"], fc=AA_FC, bg=AA_BG, wrap=True)
-        ws.row_dimensions[i].height = 80
+        ws.row_dimensions[i].height = 120
 
     sr = len(rows) + 3
     for col, (val, color) in enumerate([
@@ -570,7 +607,7 @@ def main():
         })
         time.sleep(0.15)
 
-    rows.sort(key=lambda r: (0 if r["tag"] == "esc" else 1, r["group"]))
+    rows.sort(key=lambda r: (0 if r["tag"] == "esc" else 1, int(r["ticket_id"])))
     esc_count  = sum(1 for r in rows if r["tag"] == "esc")
     rarc_count = sum(1 for r in rows if r["tag"] == "rarc")
     print(f"\n  {len(rows)} candidates — {esc_count} esc, {rarc_count} rarc "
