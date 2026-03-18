@@ -327,6 +327,23 @@ def main():
             try:
                 suggestion = suggest_title(client, subject, description)
             except Exception as e:
+                err = str(e)
+                if "credit balance is too low" in err or "402" in err:
+                    print(f"\n  [ERROR] Anthropic account has insufficient credits.")
+                    print(f"  [ERROR] Add credits at https://console.anthropic.com/settings/billing")
+                    print(f"  [ERROR] Saving partial results ({len(rows)} of {len(tickets)} tickets processed)...")
+                    # Append current ticket with original title then stop
+                    rows.append({
+                        "ticket_id":       tid,
+                        "group":           group,
+                        "assignee":        assignee,
+                        "status":          status,
+                        "current_title":   subject,
+                        "suggested_title": subject,
+                        "has_description": has_desc,
+                        "url":             f"{TICKET_URL}{tid}",
+                    })
+                    break
                 print(f"    Claude error: {e}")
                 suggestion = subject
         else:
