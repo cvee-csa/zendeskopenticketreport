@@ -20,6 +20,7 @@ Optional (for email delivery):
 
 import os, re, time, base64
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import requests
 from openpyxl                import Workbook
@@ -72,26 +73,33 @@ def _zd_headers():
 
 
 def fetch_tickets():
-    """Return all open/pending/on-hold tickets in the IT Ops groups."""
-    tickets, url = [], (
-        f"{BASE_ZD}/tickets.json"
-        "?per_page=100"
-        "&sort_by=updated_at&sort_order=desc"
-    )
+    """
+    Fetch open/pending/on-hold tickets from the three IT Ops groups using the
+    Search API. This avoids the 10,000-result (100-page) limit of the offset-based
+    /tickets.json endpoint by filtering directly at query time.
+    """
+    group_clause  = " OR ".join(f"group_id:{gid}" for gid in IT_OPS_GROUPS)
+    status_clause = "status:open OR status:pending OR status:hold"
+    query = f"type:ticket ({status_clause}) ({group_clause})"
+
+    tickets = []
+    url = f"{BASE_ZD}/search.json?" + urlencode({
+        "query":      query,
+        "per_page":   100,
+        "sort_by":    "updated_at",
+        "sort_order": "desc",
+    })
+
     while url:
         r = requests.get(url, headers=_zd_headers(), timeout=30)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 10)))
+            continue
         r.raise_for_status()
         data = r.json()
-        for t in data["tickets"]:
-            if (
-                t.get("status") in ("open", "pending", "on-hold")
-                and (
-                    t.get("group_id") in IT_OPS_GROUPS
-                    or t.get("assignee_id") in IT_OPS_ASSIGNEES
-                )
-            ):
-                tickets.append(t)
+        tickets.extend(data.get("results", []))
         url = data.get("next_page")
+
     print(f"  Fetched {len(tickets)} IT Ops open/pending/on-hold tickets")
     return tickets
 
@@ -161,8 +169,8 @@ def classify(ticket, comments):
         last_itops_idx = next(
             (i for i, c in enumerate(comments) if c["id"] == last_itops["id"]), -1
         )
-        subsequent       = comments[last_itops_idx + 1:]
-        requester_id     = ticket.get("requester_id")
+        subsequent        = comments[last_itops_idx + 1:]
+        requester_id      = ticket.get("requester_id")
         requester_replied = any(c.get("author_id") == requester_id for c in subsequent)
         matched = _match_any(RARC_PATTERNS, last_itops.get("body", ""))
         if matched and not requester_replied:
@@ -333,11 +341,11 @@ def build_spreadsheet(rows):
         else:      rarc_n += 1
         if r["ryan_step"]: ryan_n += 1
 
-        _cell(ws, i, 1, r["tag"],       bold=True, fc=badge,    bg=main_bg, align="center")
-        _cell(ws, i, 2, r["ticket_id"], bold=True, fc="333333",  bg=main_bg, align="center")
-        _cell(ws, i, 3, r["group"],                              bg=main_bg)
-        _cell(ws, i, 4, r["subject"],                            bg=main_bg, wrap=True)
-        _cell(ws, i, 5, r["reason"],                             bg=main_bg, wrap=True)
+        _cell(ws, i, 1, r["tag"],       bold=True, fc=badge,   bg=main_bg, align="center")
+        _cell(ws, i, 2, r["ticket_id"], bold=True, fc="333333", bg=main_bg, align="center")
+        _cell(ws, i, 3, r["group"],                             bg=main_bg)
+        _cell(ws, i, 4, r["subject"],                           bg=main_bg, wrap=True)
+        _cell(ws, i, 5, r["reason"],                            bg=main_bg, wrap=True)
 
         url = f"{TICKET_URL}{r['ticket_id']}"
         lnk = ws.cell(row=i, column=6, value=url)
@@ -351,8 +359,8 @@ def build_spreadsheet(rows):
 
         step = r["ryan_step"]
         if step:
-            key       = next((k for k in RYAN_COLORS if step.startswith(k)), None)
-            bg2, fc2  = RYAN_COLORS.get(key, ("FF8C42", "FFFFFF"))
+            key      = next((k for k in RYAN_COLORS if step.startswith(k)), None)
+            bg2, fc2 = RYAN_COLORS.get(key, ("FF8C42", "FFFFFF"))
             if "expires" in step:
                 bg2, fc2 = "E53935", "FFFFFF"
             _cell(ws, i, 8, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
@@ -468,7 +476,7 @@ def main():
         tid = ticket["id"]
         print(f"  {idx}/{len(tickets)} — #{tid}", end="\r")
 
-        comments  = fetch_comments(tid)
+        comments    = fetch_comments(tid)
         tag, reason = classify(ticket, comments)
         if not tag:
             continue
