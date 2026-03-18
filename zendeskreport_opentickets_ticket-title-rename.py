@@ -135,21 +135,24 @@ def fetch_ticket_description(ticket_id):
 # ── Claude title suggestion ────────────────────────────────────────────────────
 def suggest_title(client, current_subject, description):
     """Ask Claude to suggest a better ticket title."""
-    prompt = f"""You are a Zendesk IT support ticket analyst. Your job is to write clear, specific, actionable ticket titles.
+    prompt = f"""You are a Zendesk IT support ticket analyst. Your job is to rewrite ticket titles to be clear, specific, and actionable.
 
 Current ticket title: {current_subject}
 
 Ticket description:
 {description if description else "(no description available)"}
 
-Suggest a better ticket title that:
-- Is concise (under 80 characters)
-- Clearly describes the specific issue or request
-- Uses plain language (no jargon)
-- Starts with an action verb or a clear noun phrase (e.g. "Fix...", "Set up...", "Unable to...")
-- Is more specific than the current title if possible
+Rewrite the ticket title following these rules:
+- Must be concise (under 80 characters)
+- Must clearly describe the specific issue or request
+- Must use plain language (no jargon)
+- Must start with an action verb or clear noun phrase (e.g. "Fix...", "Set up...", "Unable to...", "Request: ...", "Create...")
+- Must be more specific than the current title
+- Never start with "Re:", "Fwd:", "Fw:", or "Notification:"
+- Never repeat the current title word-for-word — always rewrite it
+- If the description provides more context than the title, use that context
 
-Respond with ONLY the suggested title — no explanation, no quotes, no punctuation at the end."""
+Respond with ONLY the rewritten title — no explanation, no quotes, no punctuation at the end."""
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
