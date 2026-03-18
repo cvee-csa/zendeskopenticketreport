@@ -1,0 +1,43 @@
+name: IT Ops Morning Tag Report
+
+on:
+  schedule:
+    # 8:00 AM Pacific Standard Time (UTC-8)
+    # Switch to "0 15 * * 1-5" during Daylight Saving Time (mid-Mar to early-Nov)
+    - cron: "0 16 * * 1-5"
+
+  # Run manually at any time from the Actions tab — useful for testing
+  workflow_dispatch:
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate report
+        env:
+          ZENDESK_EMAIL: ${{ secrets.ZENDESK_EMAIL }}
+          ZENDESK_TOKEN: ${{ secrets.ZENDESK_TOKEN }}
+          # Email is optional — add these secrets later to enable delivery
+          # GMAIL_FROM:         ${{ secrets.GMAIL_FROM }}
+          # GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # GMAIL_TO:           ${{ secrets.GMAIL_TO }}
+        run: python morning_report.py
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IT_Ops_Tag_Report_${{ github.run_id }}
+          path: /tmp/IT_Ops_Tag_Report_*.xlsx
+          retention-days: 30
