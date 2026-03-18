@@ -2,9 +2,18 @@ name: IT Ops Morning Tag Report
 
 on:
   schedule:
-    # 8:00 AM Pacific Standard Time (UTC-8)
-    # Switch to "0 15 * * 1-5" during Daylight Saving Time (mid-Mar to early-Nov)
-    - cron: "0 16 * * 1-5"
+    # All times in UTC. Pacific time offsets:
+    #   PST (Nov–Mar): UTC-8  |  PDT (Mar–Nov): UTC-7
+    #
+    #  8:00 AM PDT = 15:00 UTC  |  8:00 AM PST = 16:00 UTC
+    #  4:00 PM PDT = 23:00 UTC  |  4:00 PM PST = 00:00 UTC (next day, use "0 0 * * 2-6")
+    #
+    # Current schedule (PDT — active mid-Mar through early-Nov):
+    - cron: "0 15 * * 1-5"   # 8:00 AM PDT, Mon–Fri
+    - cron: "0 23 * * 1-5"   # 4:00 PM PDT, Mon–Fri
+    # Winter schedule (PST — swap in early-Nov through mid-Mar):
+    # - cron: "0 16 * * 1-5"  # 8:00 AM PST
+    # - cron: "0 0 * * 2-6"   # 4:00 PM PST (midnight UTC = prev day 4 PM)
 
   # Run manually at any time from the Actions tab — useful for testing
   workflow_dispatch:
