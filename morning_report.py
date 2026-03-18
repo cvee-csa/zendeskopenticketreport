@@ -77,7 +77,11 @@ def upload_to_gdrive(file_path):
         return
 
     try:
-        creds_info = json.loads(GDRIVE_SA_JSON)
+        sa_json = GDRIVE_SA_JSON.strip()
+        if not sa_json:
+            print("  [Drive] GDRIVE_SERVICE_ACCOUNT_JSON is blank after stripping whitespace — skipping.")
+            return
+        creds_info = json.loads(sa_json)
         creds = service_account.Credentials.from_service_account_info(
             creds_info,
             scopes=["https://www.googleapis.com/auth/drive"],
@@ -103,9 +107,12 @@ def upload_to_gdrive(file_path):
         print(f"  [Drive] Uploaded: {uploaded['name']}")
         print(f"  [Drive] View at : {uploaded.get('webViewLink', '(no link)')}")
 
+    except json.JSONDecodeError as e:
+        print(f"  [Drive] GDRIVE_SERVICE_ACCOUNT_JSON is not valid JSON: {e}")
+        print(f"  [Drive] Secret starts with: {repr(GDRIVE_SA_JSON[:80])}")
+        print("  [Drive] Check that the secret contains the raw JSON (not base64 or a file path).")
     except Exception as e:
         print(f"  [Drive] Upload failed: {e}")
-        raise
 
 
 # ── Zendesk API helpers ─────────────────────────────────────────────────────────
