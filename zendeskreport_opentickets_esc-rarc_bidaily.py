@@ -286,35 +286,43 @@ RARC_REASONS = {
 
 def _match_any(patterns, text):
     """Return (pattern, snippet) for the first matching pattern, or (None, None)."""
-    # Pre-clean the text so snippets are already free of HTML/markdown
+    # Pre-clean preserving newlines so we can use them as boundaries
     clean = _clean_text(text)
     for p in patterns:
         m = re.search(p, clean, re.IGNORECASE)
         if m:
-            # Walk back to the nearest sentence/line boundary before the match
             before = clean[:m.start()]
-            boundary = max(
-                before.rfind(". "),
-                before.rfind("\n"),
-                before.rfind("! "),
-                before.rfind("? "),
-            )
-            start = (boundary + 2) if boundary != -1 else max(0, m.start() - 80)
-            # If that still lands mid-sentence too far away, cap at 80 chars before match
-            if m.start() - start > 120:
-                start = max(0, m.start() - 80)
 
-            # Walk forward to the nearest sentence boundary after the match
+            # Prefer the nearest \n boundary (works well for Zendesk comments);
+            # fall back to sentence-ending punctuation.
+            best = -1
+            for sep in ("\n", ". ", "! ", "? "):
+                pos = before.rfind(sep)
+                if pos > best:
+                    best = pos
+            start = (best + 1) if best != -1 else 0
+            # Cap lookback at 100 chars before the match to avoid email-signature noise
+            if m.start() - start > 100:
+                start = max(0, m.start() - 100)
+                # re-align to next word boundary
+                space = clean.find(" ", start)
+                if space != -1 and space < m.start():
+                    start = space + 1
+
+            # Walk forward to the nearest boundary after the match
             after_text = clean[m.end():]
-            for sep in (". ", "\n", "! ", "? "):
+            end = m.end() + 80   # default
+            for sep in ("\n", ". ", "! ", "? "):
                 pos = after_text.find(sep)
-                if pos != -1 and pos < 100:
+                if pos != -1 and pos <= 120:
                     end = m.end() + pos + len(sep)
                     break
-            else:
-                end = min(len(clean), m.end() + 80)
 
+            end = min(len(clean), end)
+
+            # Collapse remaining newlines to spaces for display
             snippet = clean[start:end].strip()
+            snippet = re.sub(r"\s+", " ", snippet)
             if len(snippet) > 160:
                 snippet = snippet[:157] + "…"
             return p, snippet
@@ -389,13 +397,33 @@ def ryan_escalation(ticket, comments):
     return "Slack Ryan directly"
 
 
+# ── Last Ryan tag date ─────────────────────────────────────────────────────
+def last_ryan_tag_date(comments):
+    """
+    Return the date (MM/DD/YYYY) of the most recent comment that mentions
+    Ryan Bergsma by name, or an empty string if none.
+    """
+    ryan_cmts = [
+        c for c in comments
+        if re.search(r"ryan\s+bergsma", c.get("plain_body") or c.get("body") or "", re.IGNORECASE)
+    ]
+    if not ryan_cmts:
+        return ""
+    last_dt = max(
+        datetime.fromisoformat(c["created_at"].replace("Z", "+00:00"))
+        for c in ryan_cmts
+    )
+    return last_dt.strftime("%m/%d/%Y")
+
+
 # ── Automated action description ────────────────────────────────────────────────
 def _clean_text(text):
-    """Strip HTML entities, markdown bold markers, and collapse whitespace."""
-    text = _html.unescape(text)              # &nbsp; → space, &amp; → &, etc.
-    text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)  # **bold** / *italic*
+    """Strip HTML entities and markdown noise; preserve newlines for boundary detection."""
+    text = _html.unescape(text)                              # &nbsp; → space, &amp; → &, etc.
+    text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)  # **bold** / *italic* → plain
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)       # remove markdown images
-    text = re.sub(r"\s+", " ", text)        # collapse whitespace / newlines
+    text = re.sub(r"[ \t]+", " ", text)     # collapse horizontal whitespace only
+    text = re.sub(r"\n[ \t]*\n+", "\n", text)  # collapse multiple blank lines to one
     return text.strip()
 
 
@@ -499,9 +527,9 @@ RYAN_COLORS = {
 }
 HEADERS = [
     "Tag", "Ticket #", "Group", "Subject", "Reason to Tag",
-    "Ticket URL", "Last Updated", "Ryan Escalation", "Automated Actions",
+    "Ticket URL", "Last Updated", "Last Ryan Tag", "Ryan Escalation", "Automated Actions",
 ]
-WIDTHS = [10, 12, 26, 50, 68, 42, 14, 26, 60]
+WIDTHS = [10, 12, 26, 50, 68, 42, 14, 14, 26, 60]
 
 
 def _border():
@@ -564,17 +592,22 @@ def build_spreadsheet(rows):
 
         _cell(ws, i, 7, r["last_updated"], bg=main_bg, align="center")
 
+        # Last Ryan Tag date
+        ryan_date = r.get("last_ryan_tag", "")
+        ryan_date_bg = "FFF8E1" if ryan_date else main_bg
+        _cell(ws, i, 8, ryan_date, bg=ryan_date_bg, align="center")
+
         step = r["ryan_step"]
         if step:
             key      = next((k for k in RYAN_COLORS if step.startswith(k)), None)
             bg2, fc2 = RYAN_COLORS.get(key, ("FF8C42", "FFFFFF"))
             if "expires" in step:
                 bg2, fc2 = "E53935", "FFFFFF"
-            _cell(ws, i, 8, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
+            _cell(ws, i, 9, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
         else:
-            _cell(ws, i, 8, "", bg=main_bg, align="center")
+            _cell(ws, i, 9, "", bg=main_bg, align="center")
 
-        _cell(ws, i, 9, r["auto_action"], fc=AA_FC, bg=AA_BG, wrap=True)
+        _cell(ws, i, 10, r["auto_action"], fc=AA_FC, bg=AA_BG, wrap=True)
         ws.row_dimensions[i].height = 120
 
     sr = len(rows) + 3
@@ -623,18 +656,20 @@ def main():
         except ValueError:
             pass
 
-        ryan_step = ryan_escalation(ticket, comments) if tag == "esc" else ""
-        auto      = automated_action(tag, ryan_step, ticket, comments)
+        ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
+        last_ryan_tag = last_ryan_tag_date(comments)
+        auto          = automated_action(tag, ryan_step, ticket, comments)
 
         rows.append({
-            "tag":          tag,
-            "ticket_id":    tid,
-            "group":        group,
-            "subject":      ticket.get("subject", ""),
-            "reason":       reason,
-            "last_updated": updated,
-            "ryan_step":    ryan_step,
-            "auto_action":  auto,
+            "tag":           tag,
+            "ticket_id":     tid,
+            "group":         group,
+            "subject":       ticket.get("subject", ""),
+            "reason":        reason,
+            "last_updated":  updated,
+            "last_ryan_tag": last_ryan_tag,
+            "ryan_step":     ryan_step,
+            "auto_action":   auto,
         })
         time.sleep(0.15)
 
