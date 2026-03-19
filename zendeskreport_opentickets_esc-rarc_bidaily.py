@@ -11,7 +11,7 @@ Required environment variables:
     ZENDESK_TOKEN   Zendesk API token (Admin > Apps & Integrations > API)
 """
 
-import os, re, time, base64, json
+import os, re, time, base64, json, html as _html
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
@@ -286,15 +286,37 @@ RARC_REASONS = {
 
 def _match_any(patterns, text):
     """Return (pattern, snippet) for the first matching pattern, or (None, None)."""
+    # Pre-clean the text so snippets are already free of HTML/markdown
+    clean = _clean_text(text)
     for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
+        m = re.search(p, clean, re.IGNORECASE)
         if m:
-            # Extract a short snippet of surrounding context (up to 80 chars)
-            start = max(0, m.start() - 20)
-            end   = min(len(text), m.end() + 40)
-            snippet = text[start:end].replace("\n", " ").strip()
-            if len(snippet) > 80:
-                snippet = snippet[:77] + "..."
+            # Walk back to the nearest sentence/line boundary before the match
+            before = clean[:m.start()]
+            boundary = max(
+                before.rfind(". "),
+                before.rfind("\n"),
+                before.rfind("! "),
+                before.rfind("? "),
+            )
+            start = (boundary + 2) if boundary != -1 else max(0, m.start() - 80)
+            # If that still lands mid-sentence too far away, cap at 80 chars before match
+            if m.start() - start > 120:
+                start = max(0, m.start() - 80)
+
+            # Walk forward to the nearest sentence boundary after the match
+            after_text = clean[m.end():]
+            for sep in (". ", "\n", "! ", "? "):
+                pos = after_text.find(sep)
+                if pos != -1 and pos < 100:
+                    end = m.end() + pos + len(sep)
+                    break
+            else:
+                end = min(len(clean), m.end() + 80)
+
+            snippet = clean[start:end].strip()
+            if len(snippet) > 160:
+                snippet = snippet[:157] + "…"
             return p, snippet
     return None, None
 
@@ -368,10 +390,19 @@ def ryan_escalation(ticket, comments):
 
 
 # ── Automated action description ────────────────────────────────────────────────
+def _clean_text(text):
+    """Strip HTML entities, markdown bold markers, and collapse whitespace."""
+    text = _html.unescape(text)              # &nbsp; → space, &amp; → &, etc.
+    text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)  # **bold** / *italic*
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)       # remove markdown images
+    text = re.sub(r"\s+", " ", text)        # collapse whitespace / newlines
+    return text.strip()
+
+
 def _comment_preview(comment, max_chars=150):
     """Return a short, clean excerpt from a comment body."""
-    body = (comment.get("plain_body") or comment.get("body") or "").strip()
-    body = re.sub(r"\s+", " ", body)          # collapse whitespace/newlines
+    body = (comment.get("plain_body") or comment.get("body") or "")
+    body = _clean_text(body)
     if len(body) > max_chars:
         body = body[:max_chars - 1].rstrip() + "…"
     return body
@@ -607,7 +638,7 @@ def main():
         })
         time.sleep(0.15)
 
-    rows.sort(key=lambda r: (0 if r["tag"] == "esc" else 1, int(r["ticket_id"])))
+    rows.sort(key=lambda r: (0 if r["tag"] == "esc" else 1, -int(r["ticket_id"])))
     esc_count  = sum(1 for r in rows if r["tag"] == "esc")
     rarc_count = sum(1 for r in rows if r["tag"] == "rarc")
     print(f"\n  {len(rows)} candidates — {esc_count} esc, {rarc_count} rarc "
