@@ -284,47 +284,46 @@ RARC_REASONS = {
 }
 
 
+_EMAIL_RE = re.compile(r"@\S+\.\w{2,}")
+
+
 def _match_any(patterns, text):
     """Return (pattern, snippet) for the first matching pattern, or (None, None)."""
-    # Pre-clean preserving newlines so we can use them as boundaries
+    # Pre-clean preserving newlines so we can use them as sentence boundaries
     clean = _clean_text(text)
     for p in patterns:
         m = re.search(p, clean, re.IGNORECASE)
         if m:
             before = clean[:m.start()]
 
-            # Prefer the nearest \n boundary (works well for Zendesk comments);
-            # fall back to sentence-ending punctuation.
+            # Walk back to the nearest line / sentence boundary
             best = -1
             for sep in ("\n", ". ", "! ", "? "):
                 pos = before.rfind(sep)
                 if pos > best:
                     best = pos
             start = (best + 1) if best != -1 else 0
-            # Cap lookback at 100 chars before the match to avoid email-signature noise
-            if m.start() - start > 100:
-                start = max(0, m.start() - 100)
-                # re-align to next word boundary
-                space = clean.find(" ", start)
-                if space != -1 and space < m.start():
-                    start = space + 1
 
-            # Walk forward to the nearest boundary after the match
+            # If the text between that boundary and the match contains an email
+            # address it is almost certainly an email-signature line — skip it
+            # and start the snippet from the match itself.
+            if _EMAIL_RE.search(clean[start:m.start()]):
+                start = m.start()
+
+            # Walk forward to the nearest boundary after the match.
+            # Take the minimum (nearest) position across all separator types.
             after_text = clean[m.end():]
-            end = m.end() + 80   # default
+            end = len(clean)  # fallback: end of text
             for sep in ("\n", ". ", "! ", "? "):
                 pos = after_text.find(sep)
-                if pos != -1 and pos <= 120:
-                    end = m.end() + pos + len(sep)
-                    break
+                if pos != -1:
+                    candidate = m.end() + pos + len(sep)
+                    if candidate < end:
+                        end = candidate
 
-            end = min(len(clean), end)
-
-            # Collapse remaining newlines to spaces for display
+            # Collapse newlines to spaces for display — no hard length cap
             snippet = clean[start:end].strip()
             snippet = re.sub(r"\s+", " ", snippet)
-            if len(snippet) > 160:
-                snippet = snippet[:157] + "…"
             return p, snippet
     return None, None
 
