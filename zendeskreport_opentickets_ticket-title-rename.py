@@ -75,21 +75,28 @@ def _zd_headers():
 
 def fetch_tickets():
     """Fetch all IT Ops open/pending/hold tickets via the Zendesk search API."""
-    group_ids      = list(IT_OPS_GROUPS.keys())
+    group_ids       = list(IT_OPS_GROUPS.keys())
     target_statuses = ["open", "pending", "hold"]
-    all_tickets    = []
-    seen_ids       = set()
+    all_tickets     = []
+    seen_ids        = set()
 
     for status in target_statuses:
         for group_id in group_ids:
-            url = (
-                f"{BASE_ZD}/search.json"
-                f"?query=type:ticket+status:{status}+group_id:{group_id}"
-                f"&per_page=100"
-            )
-            page = 1
-            while url:
-                r = requests.get(url, headers=_zd_headers(), timeout=60)
+            page     = 1
+            next_url = None
+            while True:
+                if next_url:
+                    r = requests.get(next_url, headers=_zd_headers(), timeout=60)
+                else:
+                    r = requests.get(
+                        f"{BASE_ZD}/search.json",
+                        params={
+                            "query":    f"type:ticket status:{status} group_id:{group_id}",
+                            "per_page": 100,
+                        },
+                        headers=_zd_headers(),
+                        timeout=60,
+                    )
                 if r.status_code == 429:
                     time.sleep(float(r.headers.get("Retry-After", 60)))
                     continue
@@ -104,7 +111,9 @@ def fetch_tickets():
                         added += 1
                 print(f"  {IT_OPS_GROUPS[group_id]} / {status} — page {page}: "
                       f"{len(results)} results, {added} new")
-                url   = data.get("next_page")
+                next_url = data.get("next_page")
+                if not next_url:
+                    break
                 page += 1
                 time.sleep(0.5)
 
@@ -344,7 +353,6 @@ def main():
                     print(f"\n  [ERROR] Anthropic account has insufficient credits.")
                     print(f"  [ERROR] Add credits at https://console.anthropic.com/settings/billing")
                     print(f"  [ERROR] Saving partial results ({len(rows)} of {len(tickets)} tickets processed)...")
-                    # Append current ticket with original title then stop
                     rows.append({
                         "ticket_id":       tid,
                         "group":           group,
