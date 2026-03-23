@@ -17,7 +17,7 @@ Optional environment variables:
 """
 
 import os, re, time, base64, json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import requests
 from openpyxl import Workbook
@@ -53,8 +53,6 @@ TICKET_URL     = f"https://{ZENDESK_DOMAIN}/agent/tickets/"
 _now           = datetime.now(timezone.utc)
 NOW            = _now.strftime("%Y-%m-%d_%I%M") + ("am" if _now.hour < 12 else "pm")
 REPORT_PATH    = f"/tmp/IT_Ops_Title_Suggestions_{NOW}.xlsx"
-LOOKBACK_DAYS  = 60
-
 IT_OPS_GROUPS = {
     7783360594455:  "IT-Operations",
     37981538647191: "IT-Operations-Projects",
@@ -76,42 +74,42 @@ def _zd_headers():
 
 
 def fetch_tickets():
-    """Fetch IT Ops open/pending/hold tickets via incremental cursor export."""
-    since = int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp())
-    print(f"  Fetching tickets (last {LOOKBACK_DAYS} days)...")
+    """Fetch all IT Ops open/pending/hold tickets via the Zendesk search API."""
+    group_ids      = list(IT_OPS_GROUPS.keys())
+    target_statuses = ["open", "pending", "hold"]
+    all_tickets    = []
+    seen_ids       = set()
 
-    url         = f"{BASE_ZD}/incremental/tickets/cursor.json?start_time={since}"
-    all_tickets = []
-    batch       = 1
+    for status in target_statuses:
+        for group_id in group_ids:
+            url = (
+                f"{BASE_ZD}/search.json"
+                f"?query=type:ticket+status:{status}+group_id:{group_id}"
+                f"&per_page=100"
+            )
+            page = 1
+            while url:
+                r = requests.get(url, headers=_zd_headers(), timeout=60)
+                if r.status_code == 429:
+                    time.sleep(float(r.headers.get("Retry-After", 60)))
+                    continue
+                r.raise_for_status()
+                data    = r.json()
+                results = data.get("results", [])
+                added   = 0
+                for t in results:
+                    if t["id"] not in seen_ids:
+                        seen_ids.add(t["id"])
+                        all_tickets.append(t)
+                        added += 1
+                print(f"  {IT_OPS_GROUPS[group_id]} / {status} — page {page}: "
+                      f"{len(results)} results, {added} new")
+                url   = data.get("next_page")
+                page += 1
+                time.sleep(0.5)
 
-    while url:
-        r = requests.get(url, headers=_zd_headers(), timeout=60)
-        if r.status_code == 429:
-            time.sleep(float(r.headers.get("Retry-After", 60)))
-            continue
-        r.raise_for_status()
-        data = r.json()
-        all_tickets.extend(data.get("tickets", []))
-        print(f"  Batch {batch}: {len(data.get('tickets', []))} tickets "
-              f"(total so far: {len(all_tickets)})")
-        if data.get("end_of_stream", False):
-            break
-        after_url = data.get("after_url")
-        if not after_url or after_url == url:
-            break
-        url    = after_url
-        batch += 1
-        time.sleep(0.5)
-
-    it_ops_ids      = set(IT_OPS_GROUPS.keys())
-    target_statuses = {"open", "pending", "hold"}
-    tickets = [
-        t for t in all_tickets
-        if t.get("group_id") in it_ops_ids
-        and t.get("status") in target_statuses
-    ]
-    print(f"  {len(all_tickets)} total → {len(tickets)} IT Ops open/pending/hold tickets\n")
-    return tickets
+    print(f"\n  Total IT Ops open/pending/hold tickets: {len(all_tickets)}\n")
+    return all_tickets
 
 
 def fetch_ticket_description(ticket_id):
@@ -324,12 +322,22 @@ def main():
 
         print(f"  {i}/{len(tickets)} — #{tid}  {subject[:60]}")
 
+        # Skip renaming tickets whose title contains square brackets
+        has_brackets = "[" in subject or "]" in subject
+        if has_brackets:
+            print(f"    Skipping — title contains square brackets")
+
         description = fetch_ticket_description(tid)
         has_desc    = bool(description)
 
-        if has_desc:
+        if has_brackets or not has_desc:
+            suggestion = subject
+        else:
             try:
                 suggestion = suggest_title(client, subject, description)
+                # Prefix changed titles with % so they stand out
+                if suggestion.lower() != subject.lower():
+                    suggestion = f"% {suggestion}"
             except Exception as e:
                 err = str(e)
                 if "credit balance is too low" in err or "402" in err:
@@ -350,8 +358,6 @@ def main():
                     break
                 print(f"    Claude error: {e}")
                 suggestion = subject
-        else:
-            suggestion = subject
 
         rows.append({
             "ticket_id":       tid,
