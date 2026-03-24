@@ -60,6 +60,15 @@ IT_OPS_ASSIGNEES = {
 RYAN_ID = 396710941733
 KURT_ID = 396693552053
 
+# ── SLA thresholds (business hours / days) ────────────────────────────────────
+# Source: zendesk-parameters.md — "All thresholds apply to business hours only"
+SLA_INITIAL_RESPONSE_HRS = 2    # first IT Ops comment within 2 biz hrs of creation
+SLA_REQUESTER_WAIT_HRS   = 4    # max biz hours requester waits for IT Ops reply
+SLA_NO_UPDATE_HRS        = 8    # 1 biz day = 8 hrs max since any ticket update
+SLA_RESOLUTION_DAYS      = 2    # informational: open > 2 biz days flagged
+
+IT_OPS_AGENT_IDS = {19148954105367, 5720866160535, 38942574549655}  # Neeks, Jacob, Catherine
+
 DEADLINES = {
     "security.txt": datetime(2026, 4, 1, tzinfo=timezone.utc),
 }
@@ -217,6 +226,124 @@ def fetch_comments(ticket_id):
         r.raise_for_status()
         return r.json().get("comments", [])
     return []
+
+
+# ── SLA helpers ────────────────────────────────────────────────────────────────
+def _biz_hours_between(start_utc: datetime, end_utc: datetime) -> float:
+    """
+    Count business hours (Mon–Fri, 09:00–17:00 US/Pacific, UTC-8)
+    elapsed between two timezone-aware UTC datetimes.
+    Returns a float number of hours (0.0 if end <= start).
+    """
+    if end_utc <= start_utc:
+        return 0.0
+
+    PST_OFFSET = timedelta(hours=-8)   # fixed PST; close enough for SLA flagging
+    BIZ_OPEN   = 9
+    BIZ_CLOSE  = 17
+
+    # Strip tzinfo and shift to PST so we can do naive date arithmetic
+    s = (start_utc + PST_OFFSET).replace(tzinfo=None)
+    e = (end_utc   + PST_OFFSET).replace(tzinfo=None)
+
+    total_hours = 0.0
+    day = s.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = e.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    while day <= end_day:
+        if day.weekday() < 5:           # Mon=0 … Fri=4
+            seg_start = max(s, day.replace(hour=BIZ_OPEN))
+            seg_end   = min(e, day.replace(hour=BIZ_CLOSE))
+            if seg_end > seg_start:
+                total_hours += (seg_end - seg_start).total_seconds() / 3600
+        day += timedelta(days=1)
+
+    return total_hours
+
+
+def _parse_dt(s: str) -> datetime | None:
+    """Parse a Zendesk ISO-8601 timestamp string to a timezone-aware datetime."""
+    if not s:
+        return None
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def check_sla(ticket: dict, comments: list) -> dict:
+    """
+    Evaluate SLA compliance for a ticket against the thresholds in
+    zendesk-parameters.md.  Returns a dict:
+        flags   — list of human-readable flag strings
+        display — newline-joined flags, or "✓ Within SLA"
+    """
+    now        = datetime.now(timezone.utc)
+    created_at = _parse_dt(ticket.get("created_at", ""))
+    updated_at = _parse_dt(ticket.get("updated_at", ""))
+    req_id     = ticket.get("requester_id")
+
+    it_ops_cmts = [c for c in comments if c.get("author_id") in IT_OPS_AGENT_IDS]
+
+    flags = []
+
+    # 1. Initial response: first IT Ops comment within 2 biz hrs of creation
+    if created_at:
+        if it_ops_cmts:
+            first_resp_dt = _parse_dt(it_ops_cmts[0].get("created_at", ""))
+            if first_resp_dt:
+                hrs = _biz_hours_between(created_at, first_resp_dt)
+                if hrs > SLA_INITIAL_RESPONSE_HRS:
+                    flags.append(
+                        f"⚠ Initial response {hrs:.1f} biz hrs"
+                        f" (SLA: {SLA_INITIAL_RESPONSE_HRS} hrs)"
+                    )
+        else:
+            hrs = _biz_hours_between(created_at, now)
+            if hrs > SLA_INITIAL_RESPONSE_HRS:
+                flags.append(
+                    f"🚨 No IT Ops response yet — {hrs:.1f} biz hrs elapsed"
+                    f" (SLA: {SLA_INITIAL_RESPONSE_HRS} hrs)"
+                )
+
+    # 2. Requester wait: last requester comment unanswered for >4 biz hrs
+    if req_id and comments:
+        last_req = next((c for c in reversed(comments)
+                         if c.get("author_id") == req_id), None)
+        if last_req:
+            req_dt   = _parse_dt(last_req.get("created_at", ""))
+            req_idx  = next((i for i, c in enumerate(comments)
+                             if c["id"] == last_req["id"]), -1)
+            answered = any(c.get("author_id") in IT_OPS_AGENT_IDS
+                           for c in comments[req_idx + 1:])
+            if not answered and req_dt:
+                hrs = _biz_hours_between(req_dt, now)
+                if hrs > SLA_REQUESTER_WAIT_HRS:
+                    flags.append(
+                        f"🚨 Requester reply unanswered {hrs:.1f} biz hrs"
+                        f" (SLA: {SLA_REQUESTER_WAIT_HRS} hrs)"
+                    )
+
+    # 3. No update: ticket stale for >1 biz day (8 hrs)
+    if updated_at:
+        hrs = _biz_hours_between(updated_at, now)
+        if hrs > SLA_NO_UPDATE_HRS:
+            flags.append(
+                f"⚠ No update {hrs:.1f} biz hrs"
+                f" (SLA: {SLA_NO_UPDATE_HRS} hrs)"
+            )
+
+    # 4. Resolution: informational open-age flag (>2 biz days)
+    if created_at:
+        open_hrs  = _biz_hours_between(created_at, now)
+        open_days = open_hrs / 8
+        if open_days > SLA_RESOLUTION_DAYS:
+            flags.append(
+                f"ℹ Open {open_days:.1f} biz days"
+                f" (SLA: {SLA_RESOLUTION_DAYS} days)"
+            )
+
+    return {
+        "flags":   flags,
+        "display": "\n".join(flags) if flags else "✓ Within SLA",
+    }
 
 
 # ── Classification ──────────────────────────────────────────────────────────────
@@ -527,9 +654,14 @@ RYAN_COLORS = {
 }
 HEADERS = [
     "Tag", "Ticket #", "Group", "Subject", "Reason to Tag",
-    "Ticket URL", "Last Updated", "Last Ryan Tag", "Ryan Escalation", "Automated Actions",
+    "Ticket URL", "Last Updated", "SLA Flags",
+    "Last Ryan Tag", "Ryan Escalation", "Automated Actions",
 ]
-WIDTHS = [10, 12, 26, 50, 68, 42, 14, 14, 26, 60]
+WIDTHS = [10, 12, 26, 50, 68, 42, 14, 38, 14, 26, 60]
+
+SLA_BREACH_BG  = "FFF0F0"   # light red — any breach
+SLA_URGENT_BG  = "FFD6D6"   # stronger red — 🚨 flags
+SLA_OK_BG      = "F0FAF0"   # light green — within SLA
 
 
 def _border():
@@ -592,22 +724,32 @@ def build_spreadsheet(rows):
 
         _cell(ws, i, 7, r["last_updated"], bg=main_bg, align="center")
 
-        # Last Ryan Tag date
+        # SLA Flags (col 8)
+        sla_text  = r.get("sla_display", "✓ Within SLA")
+        sla_flags = r.get("sla_flags", [])
+        has_urgent = any("🚨" in f for f in sla_flags)
+        sla_bg = SLA_URGENT_BG if has_urgent else (SLA_BREACH_BG if sla_flags else SLA_OK_BG)
+        sla_fc = "8B0000" if sla_flags else "1B5E20"
+        _cell(ws, i, 8, sla_text, fc=sla_fc, bg=sla_bg, wrap=True)
+
+        # Last Ryan Tag date (col 9)
         ryan_date = r.get("last_ryan_tag", "")
         ryan_date_bg = "FFF8E1" if ryan_date else main_bg
-        _cell(ws, i, 8, ryan_date, bg=ryan_date_bg, align="center")
+        _cell(ws, i, 9, ryan_date, bg=ryan_date_bg, align="center")
 
+        # Ryan Escalation (col 10)
         step = r["ryan_step"]
         if step:
             key      = next((k for k in RYAN_COLORS if step.startswith(k)), None)
             bg2, fc2 = RYAN_COLORS.get(key, ("FF8C42", "FFFFFF"))
             if "expires" in step:
                 bg2, fc2 = "E53935", "FFFFFF"
-            _cell(ws, i, 9, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
+            _cell(ws, i, 10, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
         else:
-            _cell(ws, i, 9, "", bg=main_bg, align="center")
+            _cell(ws, i, 10, "", bg=main_bg, align="center")
 
-        _cell(ws, i, 10, r["auto_action"], fc=AA_FC, bg=AA_BG, wrap=True)
+        # Automated Actions (col 11)
+        _cell(ws, i, 11, r["auto_action"], fc=AA_FC, bg=AA_BG, wrap=True)
         ws.row_dimensions[i].height = 120
 
     sr = len(rows) + 3
@@ -659,6 +801,7 @@ def main():
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
         auto          = automated_action(tag, ryan_step, ticket, comments)
+        sla           = check_sla(ticket, comments)
 
         rows.append({
             "tag":           tag,
@@ -667,6 +810,8 @@ def main():
             "subject":       ticket.get("subject", ""),
             "reason":        reason,
             "last_updated":  updated,
+            "sla_flags":     sla["flags"],
+            "sla_display":   sla["display"],
             "last_ryan_tag": last_ryan_tag,
             "ryan_step":     ryan_step,
             "auto_action":   auto,
