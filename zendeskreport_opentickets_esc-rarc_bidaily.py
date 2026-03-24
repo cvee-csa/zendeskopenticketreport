@@ -597,16 +597,16 @@ def automated_action(tag, ryan_step, ticket, comments):
                 wait_hrs = _biz_hours_between(replied_dt, now_utc)
                 if wait_hrs >= 24:
                     actions.append(
-                        f"\u26a0 Requester silent {wait_hrs:.0f} biz hrs \u2014 "
+                        f"Requester silent {wait_hrs:.0f} biz hrs \u2014 "
                         f"consider closing or resolving")
                 else:
                     actions.append(
-                        f"\U0001f4ec Follow up with requester \u2014 "
+                        f"Follow up with requester \u2014 "
                         f"waiting {wait_hrs:.1f} biz hrs since last IT Ops reply")
             except (ValueError, TypeError):
-                actions.append("\U0001f4ec Send public reply to requester requesting an update")
+                actions.append("Send public reply to requester requesting an update")
         else:
-            actions.append("\U0001f4ec No IT Ops public reply found \u2014 send initial reply to requester")
+            actions.append("No IT Ops public reply found \u2014 send initial reply to requester")
 
     else:  # esc
         # Ryan-tag age drives the primary action
@@ -621,21 +621,18 @@ def automated_action(tag, ryan_step, ticket, comments):
 
         if ryan_days is None:
             actions.append(
-                "\U0001f4cc No Ryan outreach on record \u2014 @mention Ryan in an internal note with a specific ask")
+                "No Ryan outreach on record \u2014 @mention Ryan in an internal note with a specific ask")
         elif ryan_days == 0:
-            actions.append("\u23f3 Ryan tagged today \u2014 allow time to respond")
+            actions.append("Ryan tagged today \u2014 allow time to respond")
         elif ryan_days <= 2:
             actions.append(
-                f"\u23f3 Ryan tagged {ryan_days}d ago \u2014 allow time to respond")
+                f"Ryan tagged {ryan_days}d ago \u2014 allow time to respond")
         elif ryan_days <= 4:
             actions.append(
-                f"\U0001f501 Follow up with Ryan \u2014 tagged {ryan_days}d ago, no response yet")
+                f"Follow up with Ryan \u2014 tagged {ryan_days}d ago, no response yet")
         elif ryan_days <= 7:
             actions.append(
-                f"\U0001f534 Urgent \u2014 Ryan unresponsive {ryan_days}d; post ticket to Slack #internal")
-        else:
-            actions.append(
-                f"\U0001f6a8 Escalate to Kurt \u2014 Ryan unresponsive {ryan_days}d")
+                f"Urgent \u2014 Ryan unresponsive {ryan_days}d; post ticket to Slack #internal")
 
         # Secondary: flag very old open tickets
         created_at = ticket.get("created_at") or ""
@@ -645,7 +642,7 @@ def automated_action(tag, ryan_step, ticket, comments):
                 open_biz_days = _biz_hours_between(created_dt, now_utc) / 8
                 if open_biz_days > 10:
                     actions.append(
-                        f"\u23f0 Open {open_biz_days:.0f} biz days \u2014 clarify resolution path or close")
+                        f"Open {open_biz_days:.0f} biz days \u2014 clarify resolution path or close")
             except (ValueError, TypeError):
                 pass
 
@@ -675,7 +672,7 @@ HEADERS = [
 WIDTHS = [10, 12, 26, 50, 68, 42, 14, 38, 14, 26, 60]
 
 SLA_BREACH_BG  = "FFF0F0"   # light red — any breach
-SLA_URGENT_BG  = "FFD6D6"   # stronger red — 🚨 flags
+SLA_URGENT_BG  = "FFD6D6"   # stronger red — flags
 SLA_OK_BG      = "F0FAF0"   # light green — within SLA
 
 
