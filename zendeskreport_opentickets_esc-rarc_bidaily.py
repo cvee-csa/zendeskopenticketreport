@@ -565,12 +565,6 @@ def _comment_preview(comment, max_chars=150):
 
 
 def automated_action(tag, ryan_step, ticket, comments):
-    subj     = (ticket.get("subject") or "").lower()
-    all_text = " ".join(
-        [ticket.get("subject", ""), ticket.get("description", "")]
-        + [c.get("body", "") for c in comments]
-    ).lower()
-
     # ── Gather last internal note and last public reply from IT Ops ──────────
     it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
     last_internal = next((c for c in reversed(it_ops_cmts) if not c.get("public", True)), None)
@@ -590,55 +584,75 @@ def automated_action(tag, ryan_step, ticket, comments):
 
     context = "\n".join(context_lines)
 
-    # ── Decide action steps based on tag / escalation state ──────────────────
-    if tag == "rarc":
-        steps = (
-            "1. get_ticket_comments → confirm no requester reply since last IT Ops message.\n"
-            "2. If no reply within 3 days: create_ticket_comment (public reply) — send a friendly follow-up asking if the issue is resolved.\n"
-            "3. If no reply within 7 days: update_ticket → status = solved, with closing note."
-        )
-    elif ryan_step == "Tag Ryan in ticket":
-        steps = (
-            "1. create_ticket_comment (internal note) — @mention Ryan Bergsma with a specific ask referencing the blocked item.\n"
-            "2. get_ticket_comments after 48 h — if no acknowledgement: post ticket URL + context to Slack #internal."
-        )
-    elif ryan_step == "Slack #internal":
-        steps = (
-            "1. Open Slack → post in #internal: ticket URL + one-line summary of what is blocked and why.\n"
-            "2. create_ticket_comment (internal note) — log outreach date and exact message posted."
-        )
-    elif ryan_step and "directly" in ryan_step and "expires" in ryan_step:
-        steps = (
-            "1. Send Slack DM to Ryan Bergsma: ticket URL + deadline countdown + specific ask.\n"
-            "2. Send Slack DM to Kurt Seigfried with the same context.\n"
-            "3. Post to Slack #internal referencing both DMs.\n"
-            "4. create_ticket_comment (internal note) — log all outreach dates and messages sent."
-        )
-    elif ryan_step == "Slack Ryan directly":
-        steps = (
-            "1. Send Slack DM to Ryan Bergsma: ticket URL + specific ask.\n"
-            "2. create_ticket_comment (internal note) — record outreach date and full message sent."
-        )
-    elif "kurt" in all_text or "seigfried" in all_text:
-        steps = (
-            "1. create_ticket_comment (internal note) — @mention Kurt Seigfried with specific ask.\n"
-            "2. If no acknowledgement within 48 h: post ticket URL to Slack #internal."
-        )
-    elif any(w in subj for w in ("dev", "code", "workflow", "broken", "fix")):
-        steps = (
-            "1. get_ticket → retrieve linked Dev ticket; get_ticket_comments for current status.\n"
-            "2. create_ticket_comment (public reply) — post status update to requester.\n"
-            "3. If Dev ticket has been idle > 5 days: post to Slack #internal with ticket URL."
-        )
-    else:
-        steps = (
-            "1. get_ticket_comments → review full thread to identify next actionable step.\n"
-            "2. create_ticket_comment (public reply or internal note) — post status update or follow-up."
-        )
+    # ── Smart action: ticket-specific next step ──────────────────────────────
+    now_utc = datetime.now(timezone.utc)
+    actions = []
 
-    if context:
+    if tag == "rarc":
+        # How long has the requester been waiting since the last IT Ops public reply?
+        if last_public:
+            try:
+                replied_dt = datetime.fromisoformat(
+                    (last_public.get("created_at") or "").replace("Z", "+00:00"))
+                wait_hrs = _biz_hours_between(replied_dt, now_utc)
+                if wait_hrs >= 24:
+                    actions.append(
+                        f"\u26a0 Requester silent {wait_hrs:.0f} biz hrs \u2014 "
+                        f"consider closing or resolving")
+                else:
+                    actions.append(
+                        f"\U0001f4ec Follow up with requester \u2014 "
+                        f"waiting {wait_hrs:.1f} biz hrs since last IT Ops reply")
+            except (ValueError, TypeError):
+                actions.append("\U0001f4ec Send public reply to requester requesting an update")
+        else:
+            actions.append("\U0001f4ec No IT Ops public reply found \u2014 send initial reply to requester")
+
+    else:  # esc
+        # Ryan-tag age drives the primary action
+        ryan_tag_str = last_ryan_tag_date(comments)
+        ryan_days    = None
+        if ryan_tag_str:
+            try:
+                ryan_dt   = datetime.strptime(ryan_tag_str, "%m/%d/%Y").replace(tzinfo=timezone.utc)
+                ryan_days = (now_utc - ryan_dt).days
+            except ValueError:
+                pass
+
+        if ryan_days is None:
+            actions.append(
+                "\U0001f4cc No Ryan outreach on record \u2014 @mention Ryan in an internal note with a specific ask")
+        elif ryan_days == 0:
+            actions.append("\u23f3 Ryan tagged today \u2014 allow time to respond")
+        elif ryan_days <= 2:
+            actions.append(
+                f"\u23f3 Ryan tagged {ryan_days}d ago \u2014 allow time to respond")
+        elif ryan_days <= 4:
+            actions.append(
+                f"\U0001f501 Follow up with Ryan \u2014 tagged {ryan_days}d ago, no response yet")
+        elif ryan_days <= 7:
+            actions.append(
+                f"\U0001f534 Urgent \u2014 Ryan unresponsive {ryan_days}d; post ticket to Slack #internal")
+        else:
+            actions.append(
+                f"\U0001f6a8 Escalate to Kurt \u2014 Ryan unresponsive {ryan_days}d")
+
+        # Secondary: flag very old open tickets
+        created_at = ticket.get("created_at") or ""
+        if created_at:
+            try:
+                created_dt    = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                open_biz_days = _biz_hours_between(created_dt, now_utc) / 8
+                if open_biz_days > 10:
+                    actions.append(
+                        f"\u23f0 Open {open_biz_days:.0f} biz days \u2014 clarify resolution path or close")
+            except (ValueError, TypeError):
+                pass
+
+    steps = "\n".join(actions)
+    if context and steps:
         return f"{context}\n\n{steps}"
-    return steps
+    return context or steps
 
 
 # ── Spreadsheet builder ─────────────────────────────────────────────────────────
