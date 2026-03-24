@@ -40,8 +40,9 @@ GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")            # folder or Sha
 ZENDESK_DOMAIN = "cloudsecurityalliance.zendesk.com"
 BASE_ZD        = f"https://{ZENDESK_DOMAIN}/api/v2"
 TICKET_URL     = f"https://{ZENDESK_DOMAIN}/agent/tickets/"
-TODAY          = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-_now           = datetime.now(timezone.utc)
+PST            = timezone(timedelta(hours=-8))
+_now           = datetime.now(PST)
+TODAY          = _now.strftime("%Y-%m-%d")
 NOW            = _now.strftime("%Y-%m-%d_%I%M") + ("am" if _now.hour < 12 else "pm")
 REPORT_PATH    = f"/tmp/IT_Ops_Tag_Report_{NOW}.xlsx"
 
