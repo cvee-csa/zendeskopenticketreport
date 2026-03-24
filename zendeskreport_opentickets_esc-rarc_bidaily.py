@@ -636,7 +636,9 @@ def automated_action(tag, ryan_step, ticket, comments):
             "2. create_ticket_comment (public reply or internal note) — post status update or follow-up."
         )
 
-    return context
+    if context:
+        return f"{context}\n\n{steps}"
+    return steps
 
 
 # ── Spreadsheet builder ─────────────────────────────────────────────────────────
@@ -654,7 +656,7 @@ RYAN_COLORS = {
 HEADERS = [
     "Tag", "Ticket #", "Group", "Subject", "Reason to Tag",
     "Ticket URL", "Last Updated", "SLA Flags",
-    "Last Ryan Tag", "Ryan Escalation", "Last IT Ops Activity",
+    "Last Ryan Tag", "Ryan Escalation", "Automated Actions",
 ]
 WIDTHS = [10, 12, 26, 50, 68, 42, 14, 38, 14, 26, 60]
 
