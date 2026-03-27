@@ -17,7 +17,7 @@ Optional environment variables:
 """
 
 import os, re, time, base64, json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from openpyxl import Workbook
@@ -74,42 +74,67 @@ def _zd_headers():
 
 
 def fetch_tickets():
-    """Fetch all IT Ops open/pending/hold tickets via the Zendesk search API."""
-    group_ids      = list(IT_OPS_GROUPS.keys())
-    target_statuses = ["open", "pending", "hold"]
-    all_tickets    = []
-    seen_ids       = set()
+    """
+    Fetch IT Ops open/pending/hold tickets using the cursor-based incremental
+    export API (/api/v2/incremental/tickets/cursor.json).
 
-    for status in target_statuses:
-        for group_id in group_ids:
-            url = (
-                f"{BASE_ZD}/search.json"
-                f"?query=type:ticket+status:{status}+group_id:{group_id}"
-                f"&per_page=100"
-            )
-            page = 1
-            while url:
-                r = requests.get(url, headers=_zd_headers(), timeout=60)
-                if r.status_code == 429:
-                    time.sleep(float(r.headers.get("Retry-After", 60)))
-                    continue
-                r.raise_for_status()
-                data    = r.json()
-                results = data.get("results", [])
-                added   = 0
-                for t in results:
-                    if t["id"] not in seen_ids:
-                        seen_ids.add(t["id"])
-                        all_tickets.append(t)
-                        added += 1
-                print(f"  {IT_OPS_GROUPS[group_id]} / {status} — page {page}: "
-                      f"{len(results)} results, {added} new")
-                url   = data.get("next_page")
-                page += 1
-                time.sleep(0.5)
+    Unlike the Search API, the incremental endpoint:
+      - Has no result-count cap
+      - Is not subject to per-agent ticket-visibility restrictions
+      - Is the same approach used by the proven ESC/RARC report script
 
-    print(f"\n  Total IT Ops open/pending/hold tickets: {len(all_tickets)}\n")
-    return all_tickets
+    We pull all tickets updated in the last LOOKBACK_DAYS days, then filter
+    locally to IT Ops groups + open/pending/hold status.
+    """
+    LOOKBACK_DAYS = 60
+    since = int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp())
+    print(f"  Using incremental cursor export (last {LOOKBACK_DAYS} days, since={since})")
+
+    url         = f"{BASE_ZD}/incremental/tickets/cursor.json?start_time={since}"
+    all_tickets = []
+    batch       = 1
+
+    while url:
+        r = requests.get(url, headers=_zd_headers(), timeout=60)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 60)))
+            continue
+        r.raise_for_status()
+        data          = r.json()
+        batch_tickets = data.get("tickets", [])
+        all_tickets.extend(batch_tickets)
+        print(f"  Batch {batch}: {len(batch_tickets)} tickets (running total: {len(all_tickets)})")
+
+        if data.get("end_of_stream", False):
+            break
+        after_url = data.get("after_url")
+        if not after_url or after_url == url:
+            break
+        url    = after_url
+        batch += 1
+        time.sleep(0.5)
+
+    # Filter locally to IT Ops groups + actionable statuses
+    it_ops_ids      = set(IT_OPS_GROUPS.keys())
+    target_statuses = {"open", "pending", "hold"}
+    tickets = [
+        t for t in all_tickets
+        if t.get("group_id") in it_ops_ids
+        and t.get("status") in target_statuses
+    ]
+
+    print(f"\n  Total from API  : {len(all_tickets)} tickets")
+    print(f"  After filtering : {len(tickets)} IT Ops open/pending/hold tickets")
+    print(f"\n  --- Sample of fetched tickets (first 5) ---")
+    for t in tickets[:5]:
+        print(f"    #{t['id']} | group={IT_OPS_GROUPS.get(t.get('group_id'), t.get('group_id'))} | "
+              f"status={t.get('status')} | subject={t.get('subject','')[:60]}")
+    if not tickets:
+        print("  WARNING: 0 IT Ops tickets found after filtering.")
+        print(f"  (API returned {len(all_tickets)} total tickets in the window)")
+    print(f"  ---\n")
+
+    return tickets
 
 
 def fetch_ticket_description(ticket_id):
