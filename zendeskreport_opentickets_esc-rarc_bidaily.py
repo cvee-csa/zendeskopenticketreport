@@ -38,6 +38,7 @@ except ImportError:
 ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
 ZENDESK_TOKEN = os.environ["ZENDESK_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+DRY_RUN           = os.environ.get("DRY_RUN", "true").lower() == "true"
 
 # Google Drive upload (optional — set these secrets to enable)
 GDRIVE_SA_JSON  = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")  # full JSON key string
@@ -623,7 +624,7 @@ def suggest_reply(client, tag, ticket, comments, action_hint):
         return f"(draft unavailable: {e})"
 
 
-def automated_action(tag, ryan_step, ticket, comments, client=None):
+def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True):
     # ── Gather last internal note and last public reply from IT Ops ──────────
     it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
     last_internal = next((c for c in reversed(it_ops_cmts) if not c.get("public", True)), None)
@@ -710,7 +711,8 @@ def automated_action(tag, ryan_step, ticket, comments, client=None):
 
     if client and steps:
         draft = suggest_reply(client, tag, ticket, comments, steps)
-        return f"{base}\n\n--- DRAFT REPLY ---\n{draft}"
+        label = "--- DRAFT REPLY [DRY RUN \u2014 not posted] ---" if dry_run else "--- DRAFT REPLY [POSTED TO ZENDESK] ---"
+        return f"{base}\n\n{label}\n{draft}"
     return base
 
 
@@ -852,7 +854,8 @@ def main():
     client = None
     if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        print("  Anthropic client ready — draft replies enabled")
+        mode = "DRY RUN (not posted)" if DRY_RUN else "LIVE (will post to Zendesk)"
+        print(f"  Anthropic client ready — draft replies enabled [{mode}]")
     else:
         print("  ANTHROPIC_API_KEY not set — draft replies disabled")
 
@@ -882,7 +885,7 @@ def main():
 
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
-        auto          = automated_action(tag, ryan_step, ticket, comments, client=client)
+        auto          = automated_action(tag, ryan_step, ticket, comments, client=client, dry_run=DRY_RUN)
         sla           = check_sla(ticket, comments)
 
         rows.append({
