@@ -38,7 +38,11 @@ except ImportError:
 ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
 ZENDESK_TOKEN = os.environ["ZENDESK_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-DRY_RUN           = os.environ.get("DRY_RUN", "true").lower() == "true"
+DRY_RUN               = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+# ── Automation guardrails ───────────────────────────────────────────────────────────
+BOT_REPLY_TAG          = "it_ops_bot_replied"  # Zendesk tag applied after auto-posting
+MAX_AUTO_POSTS_PER_RUN = int(os.environ.get("MAX_AUTO_POSTS_PER_RUN", "5"))  # cap per run
 
 # Google Drive upload (optional — set these secrets to enable)
 GDRIVE_SA_JSON  = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")  # full JSON key string
@@ -572,6 +576,16 @@ def _comment_preview(comment, max_chars=150):
     return body
 
 
+def already_bot_replied(ticket):
+    """Idempotency check: True if the bot has already posted to this ticket."""
+    return BOT_REPLY_TAG in (ticket.get("tags") or [])
+
+
+def post_as_public(tag):
+    """ESC tickets must be internal notes (public=False); RARC are public replies."""
+    return tag != "esc"
+
+
 def suggest_reply(client, tag, ticket, comments, action_hint):
     """Ask Claude to draft a ready-to-send Zendesk reply based on ticket context."""
     subject = ticket.get("subject") or ticket.get("raw_subject") or "(no title)"
@@ -624,7 +638,7 @@ def suggest_reply(client, tag, ticket, comments, action_hint):
         return f"(draft unavailable: {e})"
 
 
-def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True):
+def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True, skip_reason=None):
     # ── Gather last internal note and last public reply from IT Ops ──────────
     it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
     last_internal = next((c for c in reversed(it_ops_cmts) if not c.get("public", True)), None)
@@ -710,6 +724,8 @@ def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True
     base = f"{context}\n\n{steps}" if (context and steps) else (context or steps)
 
     if client and steps:
+        if skip_reason:
+            return f"{base}\n\nAuto-reply skipped: {skip_reason}"
         draft = suggest_reply(client, tag, ticket, comments, steps)
         label = "--- DRAFT REPLY [DRY RUN \u2014 not posted] ---" if dry_run else "--- DRAFT REPLY [POSTED TO ZENDESK] ---"
         return f"{base}\n\n{label}\n{draft}"
@@ -865,6 +881,7 @@ def main():
     print(f"[ 2/3 ] Analysing {len(tickets)} tickets...")
     rows = []
     skipped = 0
+    auto_post_count = 0  # tracks live posts this run (Phase 2)
     for idx, ticket in enumerate(tickets, 1):
         tid = ticket["id"]
         print(f"  {idx}/{len(tickets)} — #{tid}", end="\r")
@@ -885,7 +902,22 @@ def main():
 
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
-        auto          = automated_action(tag, ryan_step, ticket, comments, client=client, dry_run=DRY_RUN)
+        already_replied = already_bot_replied(ticket)
+        over_post_cap   = auto_post_count >= MAX_AUTO_POSTS_PER_RUN
+        skip_reason     = (
+            "Bot reply already posted to this ticket" if already_replied
+            else f"Per-run auto-post cap reached ({MAX_AUTO_POSTS_PER_RUN}/run)" if over_post_cap
+            else None
+        )
+        auto            = automated_action(
+            tag, ryan_step, ticket, comments,
+            client=client, dry_run=DRY_RUN, skip_reason=skip_reason,
+        )
+        # Phase 2 — uncomment to enable live Zendesk posting:
+        # if not DRY_RUN and not skip_reason and client:
+        #     post_comment(tid, draft_text, public=post_as_public(tag))
+        #     tag_ticket(tid, BOT_REPLY_TAG)
+        #     auto_post_count += 1
         sla           = check_sla(ticket, comments)
 
         rows.append({
