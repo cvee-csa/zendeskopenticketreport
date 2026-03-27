@@ -28,9 +28,16 @@ try:
 except ImportError:
     GDRIVE_AVAILABLE = False
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 # ── Credentials ────────────────────────────────────────────────────────────────
 ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
 ZENDESK_TOKEN = os.environ["ZENDESK_TOKEN"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 # Google Drive upload (optional — set these secrets to enable)
 GDRIVE_SA_JSON  = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")  # full JSON key string
@@ -40,8 +47,9 @@ GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")            # folder or Sha
 ZENDESK_DOMAIN = "cloudsecurityalliance.zendesk.com"
 BASE_ZD        = f"https://{ZENDESK_DOMAIN}/api/v2"
 TICKET_URL     = f"https://{ZENDESK_DOMAIN}/agent/tickets/"
-TODAY          = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-_now           = datetime.now(timezone.utc)
+PST            = timezone(timedelta(hours=-8))
+_now           = datetime.now(PST)
+TODAY          = _now.strftime("%Y-%m-%d")
 NOW            = _now.strftime("%Y-%m-%d_%I%M") + ("am" if _now.hour < 12 else "pm")
 REPORT_PATH    = f"/tmp/IT_Ops_Tag_Report_{NOW}.xlsx"
 
@@ -563,13 +571,59 @@ def _comment_preview(comment, max_chars=150):
     return body
 
 
-def automated_action(tag, ryan_step, ticket, comments):
-    subj     = (ticket.get("subject") or "").lower()
-    all_text = " ".join(
-        [ticket.get("subject", ""), ticket.get("description", "")]
-        + [c.get("body", "") for c in comments]
-    ).lower()
+def suggest_reply(client, tag, ticket, comments, action_hint):
+    """Ask Claude to draft a ready-to-send Zendesk reply based on ticket context."""
+    subject = ticket.get("subject") or ticket.get("raw_subject") or "(no title)"
 
+    convo_lines = []
+    for c in (comments or [])[-10:]:
+        role       = "IT Ops" if c.get("author_id") in IT_OPS_ASSIGNEES else "Requester"
+        visibility = "internal" if not c.get("public", True) else "public"
+        date       = (c.get("created_at") or "")[:10]
+        body       = _clean_text(c.get("body") or c.get("html_body") or "")[:400]
+        convo_lines.append(f"[{date} | {role} | {visibility}]\n{body}")
+
+    convo = "\n\n".join(convo_lines) if convo_lines else "(no conversation yet)"
+
+    if tag == "rarc":
+        system = (
+            "You are an IT support agent drafting a short, professional Zendesk reply "
+            "to the requester. Be specific to this ticket, reference the actual issue, "
+            "and use the requester's first name if visible. "
+            "Do not use generic filler. Output only the reply text, nothing else."
+        )
+        prompt = (
+            f"Ticket: {subject}\n"
+            f"Situation: {action_hint}\n\n"
+            f"Recent conversation:\n{convo}\n\n"
+            f"Write the public reply to the requester."
+        )
+    else:  # esc
+        system = (
+            "You are an IT support agent writing a brief internal Zendesk note for the team. "
+            "Include the key ticket context and a specific ask for the person being tagged. "
+            "Do not use generic filler. Output only the note text, nothing else."
+        )
+        prompt = (
+            f"Ticket: {subject}\n"
+            f"Situation: {action_hint}\n\n"
+            f"Recent conversation:\n{convo}\n\n"
+            f"Write the internal note."
+        )
+
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        return f"(draft unavailable: {e})"
+
+
+def automated_action(tag, ryan_step, ticket, comments, client=None):
     # ── Gather last internal note and last public reply from IT Ops ──────────
     it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
     last_internal = next((c for c in reversed(it_ops_cmts) if not c.get("public", True)), None)
@@ -589,55 +643,75 @@ def automated_action(tag, ryan_step, ticket, comments):
 
     context = "\n".join(context_lines)
 
-    # ── Decide action steps based on tag / escalation state ──────────────────
-    if tag == "rarc":
-        steps = (
-            "1. get_ticket_comments → confirm no requester reply since last IT Ops message.\n"
-            "2. If no reply within 3 days: create_ticket_comment (public reply) — send a friendly follow-up asking if the issue is resolved.\n"
-            "3. If no reply within 7 days: update_ticket → status = solved, with closing note."
-        )
-    elif ryan_step == "Tag Ryan in ticket":
-        steps = (
-            "1. create_ticket_comment (internal note) — @mention Ryan Bergsma with a specific ask referencing the blocked item.\n"
-            "2. get_ticket_comments after 48 h — if no acknowledgement: post ticket URL + context to Slack #internal."
-        )
-    elif ryan_step == "Slack #internal":
-        steps = (
-            "1. Open Slack → post in #internal: ticket URL + one-line summary of what is blocked and why.\n"
-            "2. create_ticket_comment (internal note) — log outreach date and exact message posted."
-        )
-    elif ryan_step and "directly" in ryan_step and "expires" in ryan_step:
-        steps = (
-            "1. Send Slack DM to Ryan Bergsma: ticket URL + deadline countdown + specific ask.\n"
-            "2. Send Slack DM to Kurt Seigfried with the same context.\n"
-            "3. Post to Slack #internal referencing both DMs.\n"
-            "4. create_ticket_comment (internal note) — log all outreach dates and messages sent."
-        )
-    elif ryan_step == "Slack Ryan directly":
-        steps = (
-            "1. Send Slack DM to Ryan Bergsma: ticket URL + specific ask.\n"
-            "2. create_ticket_comment (internal note) — record outreach date and full message sent."
-        )
-    elif "kurt" in all_text or "seigfried" in all_text:
-        steps = (
-            "1. create_ticket_comment (internal note) — @mention Kurt Seigfried with specific ask.\n"
-            "2. If no acknowledgement within 48 h: post ticket URL to Slack #internal."
-        )
-    elif any(w in subj for w in ("dev", "code", "workflow", "broken", "fix")):
-        steps = (
-            "1. get_ticket → retrieve linked Dev ticket; get_ticket_comments for current status.\n"
-            "2. create_ticket_comment (public reply) — post status update to requester.\n"
-            "3. If Dev ticket has been idle > 5 days: post to Slack #internal with ticket URL."
-        )
-    else:
-        steps = (
-            "1. get_ticket_comments → review full thread to identify next actionable step.\n"
-            "2. create_ticket_comment (public reply or internal note) — post status update or follow-up."
-        )
+    # ── Smart action: ticket-specific next step ──────────────────────────────
+    now_utc = datetime.now(timezone.utc)
+    actions = []
 
-    if context:
-        return f"{context}\n\n{steps}"
-    return steps
+    if tag == "rarc":
+        # How long has the requester been waiting since the last IT Ops public reply?
+        if last_public:
+            try:
+                replied_dt = datetime.fromisoformat(
+                    (last_public.get("created_at") or "").replace("Z", "+00:00"))
+                wait_hrs = _biz_hours_between(replied_dt, now_utc)
+                if wait_hrs >= 24:
+                    actions.append(
+                        f"Requester silent {wait_hrs:.0f} biz hrs \u2014 "
+                        f"consider closing or resolving")
+                else:
+                    actions.append(
+                        f"Follow up with requester \u2014 "
+                        f"waiting {wait_hrs:.1f} biz hrs since last IT Ops reply")
+            except (ValueError, TypeError):
+                actions.append("Send public reply to requester requesting an update")
+        else:
+            actions.append("No IT Ops public reply found \u2014 send initial reply to requester")
+
+    else:  # esc
+        # Ryan-tag age drives the primary action
+        ryan_tag_str = last_ryan_tag_date(comments)
+        ryan_days    = None
+        if ryan_tag_str:
+            try:
+                ryan_dt   = datetime.strptime(ryan_tag_str, "%m/%d/%Y").replace(tzinfo=timezone.utc)
+                ryan_days = (now_utc - ryan_dt).days
+            except ValueError:
+                pass
+
+        if ryan_days is None:
+            actions.append(
+                "No Ryan outreach on record \u2014 @mention Ryan in an internal note with a specific ask")
+        elif ryan_days == 0:
+            actions.append("Ryan tagged today \u2014 allow time to respond")
+        elif ryan_days <= 2:
+            actions.append(
+                f"Ryan tagged {ryan_days}d ago \u2014 allow time to respond")
+        elif ryan_days <= 4:
+            actions.append(
+                f"Follow up with Ryan \u2014 tagged {ryan_days}d ago, no response yet")
+        elif ryan_days <= 7:
+            actions.append(
+                f"Urgent \u2014 Ryan unresponsive {ryan_days}d; post ticket to Slack #internal")
+
+        # Secondary: flag very old open tickets
+        created_at = ticket.get("created_at") or ""
+        if created_at:
+            try:
+                created_dt    = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                open_biz_days = _biz_hours_between(created_dt, now_utc) / 8
+                if open_biz_days > 10:
+                    actions.append(
+                        f"Open {open_biz_days:.0f} biz days \u2014 clarify resolution path or close")
+            except (ValueError, TypeError):
+                pass
+
+    steps = "\n".join(actions)
+    base = f"{context}\n\n{steps}" if (context and steps) else (context or steps)
+
+    if client and steps:
+        draft = suggest_reply(client, tag, ticket, comments, steps)
+        return f"{base}\n\n--- DRAFT REPLY ---\n{draft}"
+    return base
 
 
 # ── Spreadsheet builder ─────────────────────────────────────────────────────────
@@ -660,7 +734,11 @@ HEADERS = [
 WIDTHS = [10, 12, 26, 50, 68, 42, 14, 38, 14, 26, 60]
 
 SLA_BREACH_BG  = "FFF0F0"   # light red — any breach
+<<<<<<< HEAD
 SLA_URGENT_BG  = "FFD6D6"   # stronger red — 🚨 flags
+=======
+SLA_URGENT_BG  = "FFD6D6"   # stronger red — flags
+>>>>>>> bf383446e9da6a9d3832939b596ec78939f31dec
 SLA_OK_BG      = "F0FAF0"   # light green — within SLA
 
 
@@ -774,6 +852,14 @@ def main():
     print(f"IT Ops Tag Report — {TODAY}")
     print(f"{'='*60}\n")
 
+    # Anthropic client for Claude-generated draft replies (optional)
+    client = None
+    if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        print("  Anthropic client ready — draft replies enabled")
+    else:
+        print("  ANTHROPIC_API_KEY not set — draft replies disabled")
+
     print("[ 1/3 ] Fetching Zendesk tickets...")
     tickets = fetch_tickets()
 
@@ -800,7 +886,11 @@ def main():
 
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
+<<<<<<< HEAD
         auto          = automated_action(tag, ryan_step, ticket, comments)
+=======
+        auto          = automated_action(tag, ryan_step, ticket, comments, client=client)
+>>>>>>> bf383446e9da6a9d3832939b596ec78939f31dec
         sla           = check_sla(ticket, comments)
 
         rows.append({
