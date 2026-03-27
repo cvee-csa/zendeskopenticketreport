@@ -734,11 +734,7 @@ HEADERS = [
 WIDTHS = [10, 12, 26, 50, 68, 42, 14, 38, 14, 26, 60]
 
 SLA_BREACH_BG  = "FFF0F0"   # light red — any breach
-<<<<<<< HEAD
-SLA_URGENT_BG  = "FFD6D6"   # stronger red — 🚨 flags
-=======
 SLA_URGENT_BG  = "FFD6D6"   # stronger red — flags
->>>>>>> bf383446e9da6a9d3832939b596ec78939f31dec
 SLA_OK_BG      = "F0FAF0"   # light green — within SLA
 
 
@@ -886,11 +882,7 @@ def main():
 
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
-<<<<<<< HEAD
-        auto          = automated_action(tag, ryan_step, ticket, comments)
-=======
         auto          = automated_action(tag, ryan_step, ticket, comments, client=client)
->>>>>>> bf383446e9da6a9d3832939b596ec78939f31dec
         sla           = check_sla(ticket, comments)
 
         rows.append({
