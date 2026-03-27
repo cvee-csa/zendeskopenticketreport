@@ -28,9 +28,16 @@ try:
 except ImportError:
     GDRIVE_AVAILABLE = False
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 # ── Credentials ────────────────────────────────────────────────────────────────
 ZENDESK_EMAIL = os.environ["ZENDESK_EMAIL"]
 ZENDESK_TOKEN = os.environ["ZENDESK_TOKEN"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 # Google Drive upload (optional — set these secrets to enable)
 GDRIVE_SA_JSON  = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")  # full JSON key string
@@ -564,7 +571,59 @@ def _comment_preview(comment, max_chars=150):
     return body
 
 
-def automated_action(tag, ryan_step, ticket, comments):
+def suggest_reply(client, tag, ticket, comments, action_hint):
+    """Ask Claude to draft a ready-to-send Zendesk reply based on ticket context."""
+    subject = ticket.get("subject") or ticket.get("raw_subject") or "(no title)"
+
+    convo_lines = []
+    for c in (comments or [])[-10:]:
+        role       = "IT Ops" if c.get("author_id") in IT_OPS_ASSIGNEES else "Requester"
+        visibility = "internal" if not c.get("public", True) else "public"
+        date       = (c.get("created_at") or "")[:10]
+        body       = _clean_text(c.get("body") or c.get("html_body") or "")[:400]
+        convo_lines.append(f"[{date} | {role} | {visibility}]\n{body}")
+
+    convo = "\n\n".join(convo_lines) if convo_lines else "(no conversation yet)"
+
+    if tag == "rarc":
+        system = (
+            "You are an IT support agent drafting a short, professional Zendesk reply "
+            "to the requester. Be specific to this ticket, reference the actual issue, "
+            "and use the requester's first name if visible. "
+            "Do not use generic filler. Output only the reply text, nothing else."
+        )
+        prompt = (
+            f"Ticket: {subject}\n"
+            f"Situation: {action_hint}\n\n"
+            f"Recent conversation:\n{convo}\n\n"
+            f"Write the public reply to the requester."
+        )
+    else:  # esc
+        system = (
+            "You are an IT support agent writing a brief internal Zendesk note for the team. "
+            "Include the key ticket context and a specific ask for the person being tagged. "
+            "Do not use generic filler. Output only the note text, nothing else."
+        )
+        prompt = (
+            f"Ticket: {subject}\n"
+            f"Situation: {action_hint}\n\n"
+            f"Recent conversation:\n{convo}\n\n"
+            f"Write the internal note."
+        )
+
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        return f"(draft unavailable: {e})"
+
+
+def automated_action(tag, ryan_step, ticket, comments, client=None):
     # ── Gather last internal note and last public reply from IT Ops ──────────
     it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
     last_internal = next((c for c in reversed(it_ops_cmts) if not c.get("public", True)), None)
@@ -647,9 +706,12 @@ def automated_action(tag, ryan_step, ticket, comments):
                 pass
 
     steps = "\n".join(actions)
-    if context and steps:
-        return f"{context}\n\n{steps}"
-    return context or steps
+    base = f"{context}\n\n{steps}" if (context and steps) else (context or steps)
+
+    if client and steps:
+        draft = suggest_reply(client, tag, ticket, comments, steps)
+        return f"{base}\n\n--- DRAFT REPLY ---\n{draft}"
+    return base
 
 
 # ── Spreadsheet builder ─────────────────────────────────────────────────────────
@@ -786,6 +848,14 @@ def main():
     print(f"IT Ops Tag Report — {TODAY}")
     print(f"{'='*60}\n")
 
+    # Anthropic client for Claude-generated draft replies (optional)
+    client = None
+    if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        print("  Anthropic client ready — draft replies enabled")
+    else:
+        print("  ANTHROPIC_API_KEY not set — draft replies disabled")
+
     print("[ 1/3 ] Fetching Zendesk tickets...")
     tickets = fetch_tickets()
 
@@ -812,7 +882,7 @@ def main():
 
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
-        auto          = automated_action(tag, ryan_step, ticket, comments)
+        auto          = automated_action(tag, ryan_step, ticket, comments, client=client)
         sla           = check_sla(ticket, comments)
 
         rows.append({
