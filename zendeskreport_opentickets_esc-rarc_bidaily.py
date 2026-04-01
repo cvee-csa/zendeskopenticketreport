@@ -286,7 +286,7 @@ def check_sla(ticket: dict, comments: list) -> dict:
     Evaluate SLA compliance for a ticket against the thresholds in
     zendesk-parameters.md.  Returns a dict:
         flags   — list of human-readable flag strings
-        display — newline-joined flags, or "✓ Within SLA"
+        display — newline-joined flags, or "OK - Within SLA"
     """
     now        = datetime.now(timezone.utc)
     created_at = _parse_dt(ticket.get("created_at", ""))
@@ -305,14 +305,14 @@ def check_sla(ticket: dict, comments: list) -> dict:
                 hrs = _biz_hours_between(created_at, first_resp_dt)
                 if hrs > SLA_INITIAL_RESPONSE_HRS:
                     flags.append(
-                        f"⚠ Initial response {hrs:.1f} biz hrs"
+                        f"[WARN] Initial response {hrs:.1f} biz hrs"
                         f" (SLA: {SLA_INITIAL_RESPONSE_HRS} hrs)"
                     )
         else:
             hrs = _biz_hours_between(created_at, now)
             if hrs > SLA_INITIAL_RESPONSE_HRS:
                 flags.append(
-                    f"🚨 No IT Ops response yet — {hrs:.1f} biz hrs elapsed"
+                    f"[ALERT] No IT Ops response yet — {hrs:.1f} biz hrs elapsed"
                     f" (SLA: {SLA_INITIAL_RESPONSE_HRS} hrs)"
                 )
 
@@ -330,7 +330,7 @@ def check_sla(ticket: dict, comments: list) -> dict:
                 hrs = _biz_hours_between(req_dt, now)
                 if hrs > SLA_REQUESTER_WAIT_HRS:
                     flags.append(
-                        f"🚨 Requester reply unanswered {hrs:.1f} biz hrs"
+                        f"[ALERT] Requester reply unanswered {hrs:.1f} biz hrs"
                         f" (SLA: {SLA_REQUESTER_WAIT_HRS} hrs)"
                     )
 
@@ -339,7 +339,7 @@ def check_sla(ticket: dict, comments: list) -> dict:
         hrs = _biz_hours_between(updated_at, now)
         if hrs > SLA_NO_UPDATE_HRS:
             flags.append(
-                f"⚠ No update {hrs:.1f} biz hrs"
+                f"[WARN] No update {hrs:.1f} biz hrs"
                 f" (SLA: {SLA_NO_UPDATE_HRS} hrs)"
             )
 
@@ -349,13 +349,13 @@ def check_sla(ticket: dict, comments: list) -> dict:
         open_days = open_hrs / 8
         if open_days > SLA_RESOLUTION_DAYS:
             flags.append(
-                f"ℹ Open {open_days:.1f} biz days"
+                f"[INFO] Open {open_days:.1f} biz days"
                 f" (SLA: {SLA_RESOLUTION_DAYS} days)"
             )
 
     return {
         "flags":   flags,
-        "display": "\n".join(flags) if flags else "✓ Within SLA",
+        "display": "\n".join(flags) if flags else "OK - Within SLA",
     }
 
 
@@ -638,6 +638,78 @@ def suggest_reply(client, tag, ticket, comments, action_hint):
         return f"(draft unavailable: {e})"
 
 
+def assess_urgency(client, tag, ticket, comments, sla_flags):
+    """
+    Use Claude to produce a single urgency assessment for a ticket.
+    Considers: request summary, who the request is actually for,
+    missing information needed to resolve the ticket, SLA status,
+    and escalation type (esc/rarc).
+
+    Returns a string like:
+        "HIGH | [summary] | For: [person] | Missing: [info]"
+    """
+    if not client:
+        # Fallback: rule-based urgency when no API key
+        breach_count = len(sla_flags)
+        if breach_count >= 3 or any("[ALERT]" in f for f in sla_flags):
+            return "HIGH — Multiple SLA breaches detected"
+        elif breach_count >= 1:
+            return "MEDIUM — SLA flag(s) present"
+        else:
+            return "LOW — Within SLA"
+
+    subject = ticket.get("subject") or ticket.get("raw_subject") or "(no title)"
+    description = _clean_text(ticket.get("description") or "")[:600]
+
+    convo_lines = []
+    for c in (comments or [])[-8:]:
+        role       = "IT Ops" if c.get("author_id") in IT_OPS_ASSIGNEES else "Requester"
+        date       = (c.get("created_at") or "")[:10]
+        body       = _clean_text(c.get("body") or c.get("html_body") or "")[:300]
+        convo_lines.append(f"[{date} | {role}]\n{body}")
+
+    convo = "\n\n".join(convo_lines) if convo_lines else "(no conversation)"
+    sla_text = "\n".join(sla_flags) if sla_flags else "Within SLA"
+
+    system = (
+        "You are an IT operations analyst assessing ticket urgency. "
+        "You must output EXACTLY one line in this format:\n"
+        "URGENCY | SUMMARY | FOR | MISSING\n\n"
+        "Where:\n"
+        "- URGENCY is one of: HIGH, MEDIUM, LOW\n"
+        "- SUMMARY is a 1-sentence summary of what is being requested\n"
+        "- FOR is the person or team the request is actually for "
+        "(this is NOT always the requester — read the conversation carefully)\n"
+        "- MISSING is what information or action is still needed to resolve this, "
+        "or 'None' if nothing is missing\n\n"
+        "Urgency factors: number and severity of SLA breaches, "
+        "whether the ticket is escalated (esc) vs awaiting requester (rarc), "
+        "how long the ticket has been open, and whether critical info is missing.\n"
+        "esc tickets blocking on leadership/Ryan are generally MEDIUM-HIGH. "
+        "rarc tickets just awaiting confirmation are generally LOW-MEDIUM.\n"
+        "Output ONLY the single line, nothing else."
+    )
+    prompt = (
+        f"Tag: {tag.upper()}\n"
+        f"Subject: {subject}\n"
+        f"Description: {description}\n\n"
+        f"SLA Status:\n{sla_text}\n\n"
+        f"Recent conversation:\n{convo}\n\n"
+        f"Assess this ticket."
+    )
+
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        return f"(urgency unavailable: {e})"
+
+
 def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True, skip_reason=None):
     # ── Gather last internal note and last public reply from IT Ops ──────────
     it_ops_cmts   = [c for c in comments if c.get("author_id") in IT_OPS_ASSIGNEES]
@@ -738,18 +810,18 @@ ESC_FILL    = "FFE8E8";  ALT_ESC    = "FFF0F0"
 RARC_FILL   = "E8F4E8";  ALT_RARC   = "F0FAF0"
 ESC_BADGE   = "C0392B";  RARC_BADGE = "27AE60"
 LINK_COLOR  = "1155CC"
-AA_BG       = "EEF4FB";  AA_FC      = "1A3A5C"
+
 RYAN_COLORS = {
     "Tag Ryan in ticket":  ("FFF3CD", "5D4037"),
     "Slack #internal":     ("FFD580", "4E342E"),
     "Slack Ryan directly": ("FF8C42", "FFFFFF"),
 }
 HEADERS = [
-    "Tag", "Ticket #", "Group", "Subject", "Reason to Tag",
-    "Ticket URL", "Last Updated", "SLA Flags",
-    "Last Ryan Tag", "Ryan Escalation", "Automated Actions",
+    "Tag", "Ticket #", "Group", "Subject", "Urgency",
+    "Reason to Tag", "Ticket URL", "Last Updated", "SLA Flags",
+    "Last Ryan Tag", "Ryan Escalation",
 ]
-WIDTHS = [10, 12, 26, 50, 68, 42, 14, 38, 14, 26, 60]
+WIDTHS = [10, 12, 26, 50, 60, 68, 42, 14, 38, 14, 26]
 
 SLA_BREACH_BG  = "FFF0F0"   # light red — any breach
 SLA_URGENT_BG  = "FFD6D6"   # stronger red — flags
@@ -772,89 +844,125 @@ def _cell(ws, row, col, value, bold=False, fc="000000",
     return c
 
 
+URGENCY_COLORS = {
+    "HIGH":   ("FFCDD2", "B71C1C"),
+    "MEDIUM": ("FFF9C4", "F57F17"),
+    "LOW":    ("C8E6C9", "1B5E20"),
+}
+SUMMARY_BG = "E8EAF6"
+
+
 def build_spreadsheet(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = "Tag Recommendations"
 
+    # ── Count summary rows at the top ──────────────────────────────────────
+    esc_n  = sum(1 for r in rows if r["tag"] == "esc")
+    rarc_n = sum(1 for r in rows if r["tag"] == "rarc")
+    ryan_n = sum(1 for r in rows if r["ryan_step"])
+
+    summary_items = [
+        ("Total Tickets:", str(len(rows)), "1F2D3D"),
+        ("ESC Tickets:",   str(esc_n),     ESC_BADGE),
+        ("RARC Tickets:",  str(rarc_n),    RARC_BADGE),
+        ("Ryan Bottleneck:", str(ryan_n),  "BF360C"),
+    ]
+    for sr, (label, val, color) in enumerate(summary_items, 1):
+        c = ws.cell(row=sr, column=1, value=label)
+        c.font = Font(name="Arial", bold=True, size=12, color=color)
+        c.fill = PatternFill("solid", start_color=SUMMARY_BG)
+        c.alignment = Alignment(horizontal="right", vertical="center")
+
+        c2 = ws.cell(row=sr, column=2, value=int(val))
+        c2.font = Font(name="Arial", bold=True, size=14, color=color)
+        c2.fill = PatternFill("solid", start_color=SUMMARY_BG)
+        c2.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Fill remaining columns with summary background for clean look
+        for col in range(3, len(HEADERS) + 1):
+            sc = ws.cell(row=sr, column=col)
+            sc.fill = PatternFill("solid", start_color=SUMMARY_BG)
+
+    ws.row_dimensions[len(summary_items) + 1].height = 6  # spacer row
+
+    # ── Header row ─────────────────────────────────────────────────────────
+    HEADER_ROW = len(summary_items) + 2  # row after summary + spacer
+
     for col, (h, w) in enumerate(zip(HEADERS, WIDTHS), 1):
-        c = ws.cell(row=1, column=col, value=h)
+        c = ws.cell(row=HEADER_ROW, column=col, value=h)
         c.font      = Font(name="Arial", bold=True, color="FFFFFF", size=11)
         c.fill      = PatternFill("solid", start_color=DARK_HEADER)
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = _border()
         ws.column_dimensions[get_column_letter(col)].width = w
-    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[HEADER_ROW].height = 24
 
-    esc_n = rarc_n = ryan_n = 0
+    DATA_START = HEADER_ROW + 1
 
-    for i, r in enumerate(rows, start=2):
+    for i, r in enumerate(rows):
+        row_num = DATA_START + i
         is_esc  = r["tag"] == "esc"
-        even    = i % 2 == 0
+        even    = row_num % 2 == 0
         main_bg = (
             (ESC_FILL if is_esc else RARC_FILL) if not even else
             (ALT_ESC  if is_esc else ALT_RARC)
         )
         badge = ESC_BADGE if is_esc else RARC_BADGE
-        if is_esc: esc_n  += 1
-        else:      rarc_n += 1
-        if r["ryan_step"]: ryan_n += 1
 
-        _cell(ws, i, 1, r["tag"],       bold=True, fc=badge,   bg=main_bg, align="center")
-        _cell(ws, i, 2, r["ticket_id"], bold=True, fc="333333", bg=main_bg, align="center")
-        _cell(ws, i, 3, r["group"],                             bg=main_bg)
-        _cell(ws, i, 4, r["subject"],                           bg=main_bg, wrap=True)
-        _cell(ws, i, 5, r["reason"],                            bg=main_bg, wrap=True)
+        _cell(ws, row_num, 1, r["tag"],       bold=True, fc=badge,   bg=main_bg, align="center")
+        _cell(ws, row_num, 2, r["ticket_id"], bold=True, fc="333333", bg=main_bg, align="center")
+        _cell(ws, row_num, 3, r["group"],                             bg=main_bg)
+        _cell(ws, row_num, 4, r["subject"],                           bg=main_bg, wrap=True)
 
+        # Urgency (col 5)
+        urgency_text = r.get("urgency", "")
+        urg_key = next((k for k in URGENCY_COLORS if urgency_text.startswith(k)), None)
+        urg_bg, urg_fc = URGENCY_COLORS.get(urg_key, (main_bg, "333333"))
+        _cell(ws, row_num, 5, urgency_text, fc=urg_fc, bg=urg_bg, wrap=True)
+
+        # Reason to Tag (col 6)
+        _cell(ws, row_num, 6, r["reason"], bg=main_bg, wrap=True)
+
+        # Ticket URL (col 7)
         url = f"{TICKET_URL}{r['ticket_id']}"
-        lnk = ws.cell(row=i, column=6, value=url)
+        lnk = ws.cell(row=row_num, column=7, value=url)
         lnk.font      = Font(name="Arial", color=LINK_COLOR, underline="single", size=11)
         lnk.alignment = Alignment(horizontal="left", vertical="top")
         lnk.hyperlink = url
         lnk.fill      = PatternFill("solid", start_color=main_bg)
         lnk.border    = _border()
 
-        _cell(ws, i, 7, r["last_updated"], bg=main_bg, align="center")
+        # Last Updated (col 8)
+        _cell(ws, row_num, 8, r["last_updated"], bg=main_bg, align="center")
 
-        # SLA Flags (col 8)
-        sla_text  = r.get("sla_display", "✓ Within SLA")
+        # SLA Flags (col 9)
+        sla_text  = r.get("sla_display", "OK - Within SLA")
         sla_flags = r.get("sla_flags", [])
-        has_urgent = any("🚨" in f for f in sla_flags)
+        has_urgent = any("[ALERT]" in f for f in sla_flags)
         sla_bg = SLA_URGENT_BG if has_urgent else (SLA_BREACH_BG if sla_flags else SLA_OK_BG)
         sla_fc = "8B0000" if sla_flags else "1B5E20"
-        _cell(ws, i, 8, sla_text, fc=sla_fc, bg=sla_bg, wrap=True)
+        _cell(ws, row_num, 9, sla_text, fc=sla_fc, bg=sla_bg, wrap=True)
 
-        # Last Ryan Tag date (col 9)
+        # Last Ryan Tag date (col 10)
         ryan_date = r.get("last_ryan_tag", "")
         ryan_date_bg = "FFF8E1" if ryan_date else main_bg
-        _cell(ws, i, 9, ryan_date, bg=ryan_date_bg, align="center")
+        _cell(ws, row_num, 10, ryan_date, bg=ryan_date_bg, align="center")
 
-        # Ryan Escalation (col 10)
+        # Ryan Escalation (col 11)
         step = r["ryan_step"]
         if step:
             key      = next((k for k in RYAN_COLORS if step.startswith(k)), None)
             bg2, fc2 = RYAN_COLORS.get(key, ("FF8C42", "FFFFFF"))
             if "expires" in step:
                 bg2, fc2 = "E53935", "FFFFFF"
-            _cell(ws, i, 10, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
+            _cell(ws, row_num, 11, step, bold=True, fc=fc2, bg=bg2, wrap=True, align="center")
         else:
-            _cell(ws, i, 10, "", bg=main_bg, align="center")
+            _cell(ws, row_num, 11, "", bg=main_bg, align="center")
 
-        # Automated Actions (col 11)
-        _cell(ws, i, 11, r["auto_action"], fc=AA_FC, bg=AA_BG, wrap=True)
-        ws.row_dimensions[i].height = 120
+        ws.row_dimensions[row_num].height = 120
 
-    sr = len(rows) + 3
-    for col, (val, color) in enumerate([
-        (f"Total: {len(rows)} tickets", "1F2D3D"),
-        (f"esc: {esc_n}",               ESC_BADGE),
-        (f"rarc: {rarc_n}",             RARC_BADGE),
-        (f"Ryan bottleneck: {ryan_n}",  "BF360C"),
-    ], 1):
-        c = ws.cell(row=sr, column=col, value=val)
-        c.font = Font(name="Arial", bold=True, size=11, color=color)
-
-    ws.freeze_panes = "A2"
+    ws.freeze_panes = f"A{HEADER_ROW + 1}"
     wb.save(REPORT_PATH)
     print(f"  Spreadsheet saved → {REPORT_PATH}")
     return esc_n, rarc_n, ryan_n
@@ -881,7 +989,6 @@ def main():
     print(f"[ 2/3 ] Analysing {len(tickets)} tickets...")
     rows = []
     skipped = 0
-    auto_post_count = 0  # tracks live posts this run (Phase 2)
     for idx, ticket in enumerate(tickets, 1):
         tid = ticket["id"]
         print(f"  {idx}/{len(tickets)} — #{tid}", end="\r")
@@ -902,36 +1009,21 @@ def main():
 
         ryan_step     = ryan_escalation(ticket, comments) if tag == "esc" else ""
         last_ryan_tag = last_ryan_tag_date(comments)
-        already_replied = already_bot_replied(ticket)
-        over_post_cap   = auto_post_count >= MAX_AUTO_POSTS_PER_RUN
-        skip_reason     = (
-            "Bot reply already posted to this ticket" if already_replied
-            else f"Per-run auto-post cap reached ({MAX_AUTO_POSTS_PER_RUN}/run)" if over_post_cap
-            else None
-        )
-        auto            = automated_action(
-            tag, ryan_step, ticket, comments,
-            client=client, dry_run=DRY_RUN, skip_reason=skip_reason,
-        )
-        # Phase 2 — uncomment to enable live Zendesk posting:
-        # if not DRY_RUN and not skip_reason and client:
-        #     post_comment(tid, draft_text, public=post_as_public(tag))
-        #     tag_ticket(tid, BOT_REPLY_TAG)
-        #     auto_post_count += 1
         sla           = check_sla(ticket, comments)
+        urgency       = assess_urgency(client, tag, ticket, comments, sla["flags"])
 
         rows.append({
             "tag":           tag,
             "ticket_id":     tid,
             "group":         group,
             "subject":       ticket.get("subject", ""),
+            "urgency":       urgency,
             "reason":        reason,
             "last_updated":  updated,
             "sla_flags":     sla["flags"],
             "sla_display":   sla["display"],
             "last_ryan_tag": last_ryan_tag,
             "ryan_step":     ryan_step,
-            "auto_action":   auto,
         })
         time.sleep(0.15)
 
