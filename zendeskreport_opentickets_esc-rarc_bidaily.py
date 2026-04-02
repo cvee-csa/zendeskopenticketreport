@@ -229,12 +229,15 @@ def fetch_tickets():
 
 
 def fetch_comments(ticket_id):
-    """Return comment list for a ticket. Retries once on rate-limit."""
+    """Return comment list for a ticket. Retries on rate-limit and transient errors."""
     url = f"{BASE_ZD}/tickets/{ticket_id}/comments.json"
-    for _ in range(2):
+    for attempt in range(3):
         r = requests.get(url, headers=_zd_headers(), timeout=30)
         if r.status_code == 429:
             time.sleep(float(r.headers.get("Retry-After", 10)))
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            time.sleep(2 ** attempt)
             continue
         r.raise_for_status()
         return r.json().get("comments", [])
