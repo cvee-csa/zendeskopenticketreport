@@ -229,12 +229,15 @@ def fetch_tickets():
 
 
 def fetch_comments(ticket_id):
-    """Return comment list for a ticket. Retries once on rate-limit."""
+    """Return comment list for a ticket. Retries on rate-limit and transient errors."""
     url = f"{BASE_ZD}/tickets/{ticket_id}/comments.json"
-    for _ in range(2):
+    for attempt in range(3):
         r = requests.get(url, headers=_zd_headers(), timeout=30)
         if r.status_code == 429:
             time.sleep(float(r.headers.get("Retry-After", 10)))
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            time.sleep(2 ** attempt)
             continue
         r.raise_for_status()
         return r.json().get("comments", [])
@@ -296,6 +299,7 @@ def check_sla(ticket: dict, comments: list) -> dict:
     it_ops_cmts = [c for c in comments if c.get("author_id") in IT_OPS_AGENT_IDS]
 
     flags = []
+    severity = "ok"  # ok, warn, alert
 
     # 1. Initial response: first IT Ops comment within 2 biz hrs of creation
     if created_at:
@@ -304,17 +308,13 @@ def check_sla(ticket: dict, comments: list) -> dict:
             if first_resp_dt:
                 hrs = _biz_hours_between(created_at, first_resp_dt)
                 if hrs > SLA_INITIAL_RESPONSE_HRS:
-                    flags.append(
-                        f"[WARN] Initial response {hrs:.1f} biz hrs"
-                        f" (SLA: {SLA_INITIAL_RESPONSE_HRS} hrs)"
-                    )
+                    flags.append(f"1st resp: {hrs:.0f}h (>{SLA_INITIAL_RESPONSE_HRS}h)")
+                    severity = "warn"
         else:
             hrs = _biz_hours_between(created_at, now)
             if hrs > SLA_INITIAL_RESPONSE_HRS:
-                flags.append(
-                    f"[ALERT] No IT Ops response yet — {hrs:.1f} biz hrs elapsed"
-                    f" (SLA: {SLA_INITIAL_RESPONSE_HRS} hrs)"
-                )
+                flags.append(f"No resp: {hrs:.0f}h")
+                severity = "alert"
 
     # 2. Requester wait: last requester comment unanswered for >4 biz hrs
     if req_id and comments:
@@ -329,33 +329,29 @@ def check_sla(ticket: dict, comments: list) -> dict:
             if not answered and req_dt:
                 hrs = _biz_hours_between(req_dt, now)
                 if hrs > SLA_REQUESTER_WAIT_HRS:
-                    flags.append(
-                        f"[ALERT] Requester reply unanswered {hrs:.1f} biz hrs"
-                        f" (SLA: {SLA_REQUESTER_WAIT_HRS} hrs)"
-                    )
+                    flags.append(f"Unanswered: {hrs:.0f}h (>{SLA_REQUESTER_WAIT_HRS}h)")
+                    severity = "alert"
 
     # 3. No update: ticket stale for >1 biz day (8 hrs)
     if updated_at:
         hrs = _biz_hours_between(updated_at, now)
         if hrs > SLA_NO_UPDATE_HRS:
-            flags.append(
-                f"[WARN] No update {hrs:.1f} biz hrs"
-                f" (SLA: {SLA_NO_UPDATE_HRS} hrs)"
-            )
+            flags.append(f"Stale: {hrs:.0f}h (>{SLA_NO_UPDATE_HRS}h)")
+            if severity == "ok":
+                severity = "warn"
 
     # 4. Resolution: informational open-age flag (>2 biz days)
     if created_at:
         open_hrs  = _biz_hours_between(created_at, now)
         open_days = open_hrs / 8
         if open_days > SLA_RESOLUTION_DAYS:
-            flags.append(
-                f"[INFO] Open {open_days:.1f} biz days"
-                f" (SLA: {SLA_RESOLUTION_DAYS} days)"
-            )
+            flags.append(f"Age: {open_days:.0f}d")
 
+    display = " | ".join(flags) if flags else "OK"
     return {
-        "flags":   flags,
-        "display": "\n".join(flags) if flags else "OK - Within SLA",
+        "flags":    flags,
+        "display":  display,
+        "severity": severity,  # "ok", "warn", or "alert"
     }
 
 
@@ -503,6 +499,53 @@ def classify(ticket, comments):
     return None, None
 
 
+def classify_reason_with_claude(client, tag, ticket, comments, regex_reason):
+    """
+    Use Claude to generate a ticket-specific reason instead of using the
+    generic regex-based description. Falls back to regex_reason if no client.
+    """
+    if not client:
+        return regex_reason
+
+    subject = _sanitize_for_api(
+        ticket.get("subject") or ticket.get("raw_subject") or "(no title)"
+    )[:200]
+
+    last_comments = []
+    for c in (comments or [])[-3:]:
+        role = "IT Ops" if c.get("author_id") in IT_OPS_ASSIGNEES else "Requester"
+        body = _sanitize_for_api(_clean_text(c.get("body") or ""))[:150]
+        last_comments.append(f"[{role}] {body}")
+    convo = "\n".join(last_comments) if last_comments else "(none)"
+
+    system = (
+        "You are an IT operations analyst. Write a single concise sentence "
+        "explaining WHY this ticket is classified as {tag}. Be specific to "
+        "the actual ticket content — reference the real issue, people involved, "
+        "or action needed. Do NOT use generic language like 'awaiting reply'. "
+        "Output ONLY the reason sentence, nothing else."
+    )
+    prompt = (
+        f"Tag: {tag.upper()}\n"
+        f"Subject: {subject}\n"
+        f"Regex classification: {regex_reason}\n"
+        f"Recent conversation:\n{convo}\n"
+        f"Write a ticket-specific reason."
+    )
+
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=80,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = msg.content[0].text.strip()
+        return result if result else regex_reason
+    except Exception:
+        return regex_reason
+
+
 # ── Ryan escalation SLA ─────────────────────────────────────────────────────────
 def ryan_escalation(ticket, comments):
     all_text = " ".join(
@@ -572,7 +615,7 @@ def _comment_preview(comment, max_chars=150):
     body = (comment.get("plain_body") or comment.get("body") or "")
     body = _clean_text(body)
     if len(body) > max_chars:
-        body = body[:max_chars - 1].rstrip() + "…"
+        body = body[:max_chars - 1].rstrip() + "\u2026"
     return body
 
 
@@ -647,25 +690,25 @@ def _sanitize_for_api(text):
     return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
+def _rule_based_urgency(sla_flags):
+    """Fallback urgency dict when Claude API is unavailable."""
+    breach_count = len(sla_flags)
+    if breach_count >= 3 or any("No resp" in f or "Unanswered" in f for f in sla_flags):
+        level = "HIGH"
+    elif breach_count >= 1:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+    return {"level": level, "summary": "", "for_whom": "", "next_step": ""}
+
+
 def assess_urgency(client, tag, ticket, comments, sla_flags):
     """
-    Use Claude to produce a single urgency assessment for a ticket.
-    Considers: request summary, who the request is actually for,
-    missing information needed to resolve the ticket, SLA status,
-    and escalation type (esc/rarc).
-
-    Returns a string like:
-        "HIGH | [summary] | For: [person] | Missing: [info]"
+    Use Claude to produce a structured urgency assessment for a ticket.
+    Returns a dict: {level, summary, for_whom, next_step}
     """
     if not client:
-        # Fallback: rule-based urgency when no API key
-        breach_count = len(sla_flags)
-        if breach_count >= 3 or any("[ALERT]" in f for f in sla_flags):
-            return "HIGH — Multiple SLA breaches detected"
-        elif breach_count >= 1:
-            return "MEDIUM — SLA flag(s) present"
-        else:
-            return "LOW — Within SLA"
+        return _rule_based_urgency(sla_flags)
 
     subject = _sanitize_for_api(
         ticket.get("subject") or ticket.get("raw_subject") or "(no title)"
@@ -683,14 +726,15 @@ def assess_urgency(client, tag, ticket, comments, sla_flags):
     sla_text = "; ".join(sla_flags) if sla_flags else "Within SLA"
 
     system = (
-        "You are an IT operations analyst. Output EXACTLY one line:\n"
-        "URGENCY | SUMMARY | FOR | MISSING\n"
-        "URGENCY: HIGH, MEDIUM, or LOW.\n"
-        "SUMMARY: 1-sentence request summary.\n"
-        "FOR: who this is actually for (not always the requester).\n"
-        "MISSING: what info/action is needed, or None.\n"
-        "esc tickets blocking on leadership are MEDIUM-HIGH. "
-        "rarc tickets awaiting confirmation are LOW-MEDIUM."
+        "You are an IT operations analyst. Output EXACTLY 4 lines, one per field:\n"
+        "URGENCY: HIGH, MEDIUM, or LOW\n"
+        "SUMMARY: 1-sentence request summary (be specific to this ticket)\n"
+        "FOR: who this is actually for \u2014 a person's name (not always the requester)\n"
+        "NEXT: the single most important next action needed, or None\n\n"
+        "Guidelines:\n"
+        "- esc tickets blocking on leadership \u2192 MEDIUM or HIGH\n"
+        "- rarc tickets awaiting confirmation \u2192 LOW or MEDIUM\n"
+        "- Multiple SLA breaches \u2192 HIGH\n"
     )
     prompt = (
         f"Tag: {tag.upper()}\nSubject: {subject}\n"
@@ -703,20 +747,27 @@ def assess_urgency(client, tag, ticket, comments, sla_flags):
     try:
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=150,
+            max_tokens=200,
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
-        return msg.content[0].text.strip()
+        text = msg.content[0].text.strip()
+        # Parse the 4-line response
+        result = {"level": "MEDIUM", "summary": "", "for_whom": "", "next_step": ""}
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("URGENCY:"):
+                val = line.split(":", 1)[1].strip().upper()
+                result["level"] = val if val in ("HIGH", "MEDIUM", "LOW") else "MEDIUM"
+            elif line.upper().startswith("SUMMARY:"):
+                result["summary"] = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("FOR:"):
+                result["for_whom"] = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("NEXT:"):
+                result["next_step"] = line.split(":", 1)[1].strip()
+        return result
     except Exception as e:
-        # Fall back to rule-based on API failure
-        breach_count = len(sla_flags)
-        if breach_count >= 3 or any("[ALERT]" in f for f in sla_flags):
-            return "HIGH — Multiple SLA breaches (API fallback)"
-        elif breach_count >= 1:
-            return "MEDIUM — SLA flag(s) present (API fallback)"
-        else:
-            return "LOW — Within SLA (API fallback)"
+        return _rule_based_urgency(sla_flags)
 
 
 def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True, skip_reason=None):
@@ -730,12 +781,12 @@ def automated_action(tag, ryan_step, ticket, comments, client=None, dry_run=True
         date    = (last_internal.get("created_at") or "")[:10]
         author  = IT_OPS_ASSIGNEES.get(last_internal.get("author_id"), "IT Ops")
         preview = _comment_preview(last_internal)
-        context_lines.append(f"[Internal note — {author}, {date}]\n\"{preview}\"")
+        context_lines.append(f"[Internal note \u2014 {author}, {date}]\n\"{preview}\"")
     if last_public:
         date    = (last_public.get("created_at") or "")[:10]
         author  = IT_OPS_ASSIGNEES.get(last_public.get("author_id"), "IT Ops")
         preview = _comment_preview(last_public)
-        context_lines.append(f"[Public reply — {author}, {date}]\n\"{preview}\"")
+        context_lines.append(f"[Public reply \u2014 {author}, {date}]\n\"{preview}\"")
 
     context = "\n".join(context_lines)
 
@@ -822,10 +873,18 @@ LINK_COLOR  = "1155CC"
 
 HEADERS = [
     "Tag", "Ticket #", "Group", "Subject", "Days Open",
-    "Urgency", "Reason", "Ticket URL", "Last Updated",
-    "SLA Flags", "Days Since Ryan",
+    "Urgency", "Summary", "For", "Next Step",
+    "Reason", "SLA", "Last Updated", "Days Since Ryan",
+    "Recommended Action",
 ]
-WIDTHS = [8, 10, 22, 44, 12, 55, 44, 40, 14, 38, 16]
+WIDTHS = [8, 12, 16, 40, 10, 10, 36, 14, 30, 36, 22, 13, 13, 40]
+
+# Shortened group display names
+GROUP_SHORT = {
+    "IT-Operations":          "IT-Ops",
+    "IT-Operations-Projects": "Projects",
+    "IT-Operations-Tasks":    "Tasks",
+}
 
 SLA_BREACH_BG  = "FFF0F0"   # light red — any breach
 SLA_URGENT_BG  = "FFD6D6"   # stronger red — flags
@@ -970,11 +1029,21 @@ def build_spreadsheet(rows):
         badge = ESC_BADGE if is_esc else RARC_BADGE
 
         # Col 1: Tag
-        _cell(ws, row_num, 1, r["tag"], bold=True, fc=badge, bg=main_bg, align="center")
-        # Col 2: Ticket #
-        _cell(ws, row_num, 2, r["ticket_id"], bold=True, fc="333333", bg=main_bg, align="center")
-        # Col 3: Group
-        _cell(ws, row_num, 3, r["group"], bg=main_bg)
+        _cell(ws, row_num, 1, r["tag"].upper(), bold=True, fc=badge, bg=main_bg, align="center")
+
+        # Col 2: Ticket # (hyperlinked)
+        url = f"{TICKET_URL}{r['ticket_id']}"
+        lnk = ws.cell(row=row_num, column=2, value=r["ticket_id"])
+        lnk.font      = Font(name="Arial", bold=True, color=LINK_COLOR, underline="single", size=11)
+        lnk.alignment = Alignment(horizontal="center", vertical="top")
+        lnk.hyperlink = url
+        lnk.fill      = PatternFill("solid", start_color=main_bg)
+        lnk.border    = _border()
+
+        # Col 3: Group (shortened)
+        short_group = GROUP_SHORT.get(r["group"], r["group"])
+        _cell(ws, row_num, 3, short_group, bg=main_bg)
+
         # Col 4: Subject
         _cell(ws, row_num, 4, r["subject"], bg=main_bg, wrap=True)
 
@@ -983,42 +1052,52 @@ def build_spreadsheet(rows):
         do_bg, do_fc = _days_open_colors(d_open)
         _cell(ws, row_num, 5, d_open, fc=do_fc, bg=do_bg, align="center", bold=True)
 
-        # Col 6: Urgency (colour-coded)
-        urgency_text = r.get("urgency", "")
-        urg_key = next((k for k in URGENCY_COLORS if urgency_text.startswith(k)), None)
-        urg_bg, urg_fc = URGENCY_COLORS.get(urg_key, (main_bg, "333333"))
-        _cell(ws, row_num, 6, urgency_text, fc=urg_fc, bg=urg_bg, wrap=True)
+        # Col 6: Urgency level (colour-coded)
+        urgency = r.get("urgency", {})
+        urg_level = urgency.get("level", "MEDIUM") if isinstance(urgency, dict) else "MEDIUM"
+        urg_bg, urg_fc = URGENCY_COLORS.get(urg_level, (main_bg, "333333"))
+        _cell(ws, row_num, 6, urg_level, fc=urg_fc, bg=urg_bg, align="center", bold=True)
 
-        # Col 7: Reason (short, no quotes)
-        _cell(ws, row_num, 7, r["reason"], bg=main_bg, wrap=True)
+        # Col 7: Summary
+        summary = urgency.get("summary", "") if isinstance(urgency, dict) else ""
+        _cell(ws, row_num, 7, summary, bg=main_bg, wrap=True)
 
-        # Col 8: Ticket URL
-        url = f"{TICKET_URL}{r['ticket_id']}"
-        lnk = ws.cell(row=row_num, column=8, value=url)
-        lnk.font      = Font(name="Arial", color=LINK_COLOR, underline="single", size=11)
-        lnk.alignment = Alignment(horizontal="left", vertical="top")
-        lnk.hyperlink = url
-        lnk.fill      = PatternFill("solid", start_color=main_bg)
-        lnk.border    = _border()
+        # Col 8: For
+        for_whom = urgency.get("for_whom", "") if isinstance(urgency, dict) else ""
+        _cell(ws, row_num, 8, for_whom, bg=main_bg, wrap=True)
 
-        # Col 9: Last Updated (staleness heat)
+        # Col 9: Next Step
+        next_step = urgency.get("next_step", "") if isinstance(urgency, dict) else ""
+        _cell(ws, row_num, 9, next_step, bg=main_bg, wrap=True)
+
+        # Col 10: Reason (Claude-generated, ticket-specific)
+        _cell(ws, row_num, 10, r["reason"], bg=main_bg, wrap=True)
+
+        # Col 11: SLA (condensed, colour-coded by severity)
+        sla_text     = r.get("sla_display", "OK")
+        sla_severity = r.get("sla_severity", "ok")
+        if sla_severity == "alert":
+            sla_bg, sla_fc = SLA_URGENT_BG, "8B0000"
+        elif sla_severity == "warn":
+            sla_bg, sla_fc = SLA_BREACH_BG, "8B0000"
+        else:
+            sla_bg, sla_fc = SLA_OK_BG, "1B5E20"
+        _cell(ws, row_num, 11, sla_text, fc=sla_fc, bg=sla_bg, wrap=True, size=10)
+
+        # Col 12: Last Updated (staleness heat)
         upd = r["last_updated"]
         st_bg, st_fc = _staleness_colors(upd)
-        _cell(ws, row_num, 9, upd, fc=st_fc, bg=st_bg, align="center", bold=True)
+        _cell(ws, row_num, 12, upd, fc=st_fc, bg=st_bg, align="center", bold=True)
 
-        # Col 10: SLA Flags
-        sla_text  = r.get("sla_display", "OK - Within SLA")
-        sla_flags = r.get("sla_flags", [])
-        has_urgent = any("[ALERT]" in f for f in sla_flags)
-        sla_bg = SLA_URGENT_BG if has_urgent else (SLA_BREACH_BG if sla_flags else SLA_OK_BG)
-        sla_fc = "8B0000" if sla_flags else "1B5E20"
-        _cell(ws, row_num, 10, sla_text, fc=sla_fc, bg=sla_bg, wrap=True)
-
-        # Col 11: Days Since Ryan
+        # Col 13: Days Since Ryan
         rd = r.get("ryan_days", "")
         rd_bg, rd_fc = _ryan_days_colors(rd)
         display_rd = rd if isinstance(rd, int) else ""
-        _cell(ws, row_num, 11, display_rd, fc=rd_fc, bg=rd_bg, align="center", bold=True)
+        _cell(ws, row_num, 13, display_rd, fc=rd_fc, bg=rd_bg, align="center", bold=True)
+
+        # Col 14: Recommended Action
+        action_text = r.get("action", "")
+        _cell(ws, row_num, 14, action_text, bg=main_bg, wrap=True, size=10)
 
         ws.row_dimensions[row_num].height = 72
 
@@ -1029,7 +1108,7 @@ def build_spreadsheet(rows):
 
     # ── Dormant section separator ──────────────────────────────────────────
     if dormant:
-        sep_text = f"DORMANT TICKETS — open > {DORMANT_THRESHOLD} biz days ({len(dormant)} tickets)"
+        sep_text = f"DORMANT TICKETS \u2014 open > {DORMANT_THRESHOLD} biz days ({len(dormant)} tickets)"
         ws.merge_cells(start_row=cur_row, start_column=1,
                        end_row=cur_row, end_column=len(HEADERS))
         c = ws.cell(row=cur_row, column=1, value=sep_text)
@@ -1045,15 +1124,102 @@ def build_spreadsheet(rows):
             cur_row += 1
 
     ws.freeze_panes = f"A{HEADER_ROW + 1}"
+
+    # ── Executive Summary sheet ───────────────────────────────────────────
+    es = wb.create_sheet("Executive Summary", 0)  # insert as first sheet
+
+    # Title
+    es.merge_cells("A1:F1")
+    title_cell = es.cell(row=1, column=1, value=f"IT Ops Report \u2014 {TODAY}")
+    title_cell.font = Font(name="Arial", bold=True, size=16, color="1F2D3D")
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    es.row_dimensions[1].height = 32
+
+    # Overview stats
+    alert_count = sum(1 for r in rows if r.get("sla_severity") == "alert")
+    warn_count  = sum(1 for r in rows if r.get("sla_severity") == "warn")
+    high_count  = sum(1 for r in rows
+                      if isinstance(r.get("urgency"), dict)
+                      and r["urgency"].get("level") == "HIGH")
+
+    stats = [
+        ("Total Tickets",    len(rows),  "1F2D3D"),
+        ("ESC (Escalated)",  esc_n,      ESC_BADGE),
+        ("RARC (Ready Close)", rarc_n,   RARC_BADGE),
+        ("HIGH Urgency",     high_count, "B71C1C"),
+        ("SLA Alerts",       alert_count, "B71C1C"),
+        ("SLA Warnings",     warn_count, "F57F17"),
+        ("Ryan Involved",    ryan_n,     "BF360C"),
+    ]
+
+    row_num = 3
+    for label, val, color in stats:
+        es.cell(row=row_num, column=1, value=label).font = Font(
+            name="Arial", bold=True, size=11, color="333333")
+        v = es.cell(row=row_num, column=2, value=val)
+        v.font = Font(name="Arial", bold=True, size=13, color=color)
+        v.alignment = Alignment(horizontal="center")
+        row_num += 1
+
+    # Top 5 urgent tickets
+    row_num += 1
+    es.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=6)
+    sec = es.cell(row=row_num, column=1, value="Top Urgent Tickets")
+    sec.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    sec.fill = PatternFill("solid", start_color=DARK_HEADER)
+    sec.alignment = Alignment(horizontal="left", vertical="center")
+    es.row_dimensions[row_num].height = 24
+    row_num += 1
+
+    top_headers = ["#", "Subject", "Urgency", "SLA", "Summary", "Next Step"]
+    top_widths  = [10, 40, 10, 22, 36, 30]
+    for ci, (h, w) in enumerate(zip(top_headers, top_widths), 1):
+        c = es.cell(row=row_num, column=ci, value=h)
+        c.font = Font(name="Arial", bold=True, size=10, color="666666")
+        c.border = _border()
+        es.column_dimensions[get_column_letter(ci)].width = w
+    row_num += 1
+
+    # Get top 5 by sort order (already sorted by urgency)
+    for r in rows[:5]:
+        urg = r.get("urgency", {})
+        urg_level = urg.get("level", "") if isinstance(urg, dict) else ""
+
+        tid_cell = es.cell(row=row_num, column=1, value=r["ticket_id"])
+        tid_url = f"{TICKET_URL}{r['ticket_id']}"
+        tid_cell.font = Font(name="Arial", color=LINK_COLOR, underline="single", size=11)
+        tid_cell.hyperlink = tid_url
+        tid_cell.border = _border()
+
+        es.cell(row=row_num, column=2, value=r["subject"][:60]).border = _border()
+
+        urg_cell = es.cell(row=row_num, column=3, value=urg_level)
+        urg_bg, urg_fc = URGENCY_COLORS.get(urg_level, ("FFFFFF", "333333"))
+        urg_cell.font = Font(name="Arial", bold=True, color=urg_fc, size=11)
+        urg_cell.fill = PatternFill("solid", start_color=urg_bg)
+        urg_cell.alignment = Alignment(horizontal="center")
+        urg_cell.border = _border()
+
+        es.cell(row=row_num, column=4, value=r.get("sla_display", "OK")).border = _border()
+
+        summary = urg.get("summary", "") if isinstance(urg, dict) else ""
+        es.cell(row=row_num, column=5, value=summary).border = _border()
+
+        next_s = urg.get("next_step", "") if isinstance(urg, dict) else ""
+        es.cell(row=row_num, column=6, value=next_s).border = _border()
+
+        es.row_dimensions[row_num].height = 28
+        row_num += 1
+
     wb.save(REPORT_PATH)
-    print(f"  Spreadsheet saved → {REPORT_PATH}")
+    print(f"  Spreadsheet saved \u2192 {REPORT_PATH}")
     return esc_n, rarc_n, ryan_n
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main():
     print(f"\n{'='*60}")
-    print(f"IT Ops Tag Report — {TODAY}")
+    print(f"IT Ops Tag Report \u2014 {TODAY}")
     print(f"{'='*60}\n")
 
     # Anthropic client for Claude-generated draft replies (optional)
@@ -1061,9 +1227,9 @@ def main():
     if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         mode = "DRY RUN (not posted)" if DRY_RUN else "LIVE (will post to Zendesk)"
-        print(f"  Anthropic client ready — draft replies enabled [{mode}]")
+        print(f"  Anthropic client ready \u2014 draft replies enabled [{mode}]")
     else:
-        print("  ANTHROPIC_API_KEY not set — draft replies disabled")
+        print("  ANTHROPIC_API_KEY not set \u2014 draft replies disabled")
 
     print("[ 1/3 ] Fetching Zendesk tickets...")
     tickets = fetch_tickets()
@@ -1073,7 +1239,7 @@ def main():
     skipped = 0
     for idx, ticket in enumerate(tickets, 1):
         tid = ticket["id"]
-        print(f"  {idx}/{len(tickets)} — #{tid}", end="\r")
+        print(f"  {idx}/{len(tickets)} \u2014 #{tid}", end="\r")
 
         comments    = fetch_comments(tid)
         tag, reason = classify(ticket, comments)
@@ -1106,7 +1272,19 @@ def main():
         days_open = ""
         if created_at:
             days_open = round(_biz_hours_between(created_at, datetime.now(timezone.utc)) / 8, 1)
-        urgency       = assess_urgency(client, tag, ticket, comments, sla["flags"])
+
+        # Structured urgency assessment (returns dict with level/summary/for_whom/next_step)
+        urgency = assess_urgency(client, tag, ticket, comments, sla["flags"])
+
+        # Claude-generated ticket-specific reason (replaces generic regex description)
+        reason = classify_reason_with_claude(client, tag, ticket, comments, reason)
+
+        # Ryan escalation step
+        ryan_step = ryan_escalation(ticket, comments)
+
+        # Automated action / recommended next steps + draft reply
+        action = automated_action(tag, ryan_step, ticket, comments,
+                                  client=client, dry_run=DRY_RUN)
 
         rows.append({
             "tag":           tag,
@@ -1118,22 +1296,28 @@ def main():
             "last_updated":  updated,
             "sla_flags":     sla["flags"],
             "sla_display":   sla["display"],
+            "sla_severity":  sla["severity"],
             "days_open":     days_open,
             "ryan_days":     ryan_days,
+            "action":        action,
         })
         time.sleep(0.15)
 
-    # Sort: most SLA flags first, then by days open descending
+    # Sort: urgency level first, then SLA severity, then days open descending
+    _urgency_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    _severity_order = {"alert": 0, "warn": 1, "ok": 2}
     def _sort_key(r):
-        has_alert = 1 if any("[ALERT]" in f for f in r["sla_flags"]) else 0
-        n_flags   = len(r["sla_flags"])
-        d_open    = r["days_open"] if isinstance(r["days_open"], (int, float)) else 0
-        return (-has_alert, -n_flags, -d_open)
+        urg = r.get("urgency", {})
+        level = urg.get("level", "MEDIUM") if isinstance(urg, dict) else "MEDIUM"
+        urg_rank = _urgency_order.get(level, 1)
+        sev_rank = _severity_order.get(r.get("sla_severity", "ok"), 2)
+        d_open   = r["days_open"] if isinstance(r["days_open"], (int, float)) else 0
+        return (urg_rank, sev_rank, -d_open)
     rows.sort(key=_sort_key)
     esc_count  = sum(1 for r in rows if r["tag"] == "esc")
     rarc_count = sum(1 for r in rows if r["tag"] == "rarc")
     ryan_count = sum(1 for r in rows if isinstance(r.get("ryan_days"), int))
-    print(f"\n  {len(rows)} candidates — {esc_count} esc, {rarc_count} rarc, "
+    print(f"\n  {len(rows)} candidates \u2014 {esc_count} esc, {rarc_count} rarc, "
           f"{ryan_count} Ryan-involved "
           f"({skipped} tickets did not match esc/rarc criteria)")
 
