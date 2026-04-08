@@ -1,114 +1,91 @@
-# zendeskopenticketreport
+# Zendesk Open Ticket Reports
 
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+Automated reporting for Cloud Security Alliance IT-Operations Zendesk tickets. Generates styled Excel spreadsheets that track SLA compliance, escalation status, and recommended actions — then uploads them to Google Drive.
 
-## Overview
+## Scripts
 
-zendeskopenticketreport is a toolset for generating reports and insights from Zendesk open ticket data. It helps teams monitor, analyze, and act on open tickets efficiently.
+### `sla_breach_report.py` — SLA Breach Report
 
-## Table of Contents
+Shows all open IT-Ops tickets with SLA compliance status, Ryan Bergsma tracking, and automation-ready Claude prompts.
 
-- [Features](#features)
-- [Getting Started](#getting-started)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Data Sources](#data-sources)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
-- [Acknowledgments](#acknowledgments)
+**Output columns:** Ticket #, Subject, SLA (breach/warning/ok + details), Ryan (last tagged date + days ago), Next Step, Status, Claude Prompt.
 
-## Features
+**What it does:**
 
-- Generate Zendesk ESC/RARC open ticket reports
-- Analyze IT Ops open tickets and highlight status / SLA issues
-- Optional Google Drive upload for generated Excel reports
+- Fetches all open/pending/hold tickets from the three IT-Ops Zendesk groups via the incremental cursor export API
+- Evaluates each ticket against four SLA thresholds (first response, requester wait, stale ticket, resolution age) using business-hours-only calculation (Mon–Fri 9–5 Pacific)
+- Tracks when Ryan Bergsma was last @mentioned in ticket comments and how many days ago
+- Recommends a next step: "Slack Ryan ticket URL", "Tag Ryan in ticket", or "Allow time to respond"
+- Classifies tickets as ESC (escalation) or RARC (ready to close) using regex pattern matching against comments
+- Generates per-ticket Claude prompts that instruct Claude to apply ESC/RARC tags and add internal notes via the Zendesk API
+- Produces a CSA-branded Excel report with color-coded severity rows and a Summary sheet with an action-required table
 
-## Getting Started
+### `zendeskreport_opentickets_esc-rarc_bidaily.py` — ESC/RARC Tag Report (legacy)
+
+The original report script. Classifies tickets as ESC or RARC, assesses urgency using Claude (Anthropic API), generates draft replies, and outputs a detailed operational report. This script requires an Anthropic API key for full functionality.
+
+## SLA Thresholds
+
+All thresholds use business hours only (Mon–Fri, 09:00–17:00 US/Pacific):
+
+| Metric | Threshold | Severity |
+|---|---|---|
+| First response | 2 business hours | Alert (no response) or Warning (late response) |
+| Requester unanswered | 4 business hours | Alert |
+| Stale ticket | 8 business hours (1 day) | Warning |
+| Resolution age | 2 business days | Informational flag |
+
+## Setup
 
 ### Prerequisites
 
-- Python 3.8 or higher
-- pip
+Python 3.10+ and pip.
 
-### Installation
-
-1. Clone the repository:
-	```
-	git clone https://github.com/your-org/zendeskopenticketreport.git
-	cd zendeskopenticketreport
-	```
-2. Install dependencies:
-	```
-	pip install -r requirements.txt
-	```
-
-## Usage
-
-### Scripts
-
-- `zendeskreport_opentickets_esc-rarc_bidaily.py`: Generates an IT Ops ESC/RARC open ticket report.
-
-### Example
+### Install
 
 ```bash
-export ZENDESK_EMAIL="your-email@example.com"
-export ZENDESK_TOKEN="your-zendesk-api-token"
+git clone https://github.com/cvee-csa/zendeskopenticketreport.git
+cd zendeskopenticketreport
+pip install -r requirements.txt
+```
+
+### Required Environment Variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ZENDESK_EMAIL` | Yes | Zendesk login email |
+| `ZENDESK_TOKEN` | Yes | Zendesk API token (Admin > Apps & Integrations > API) |
+| `GDRIVE_SERVICE_ACCOUNT_JSON` | No | Google service account JSON for Drive upload |
+| `GDRIVE_FOLDER_ID` | No | Target Google Drive folder ID |
+| `ANTHROPIC_API_KEY` | No | Enables Claude draft replies in the legacy ESC/RARC script |
+| `DRY_RUN` | No | Set to `"true"` to prevent posting replies to Zendesk (default: true) |
+
+### Run
+
+```bash
+# SLA Breach Report
+export ZENDESK_EMAIL="you@cloudsecurityalliance.org"
+export ZENDESK_TOKEN="your-token"
+python sla_breach_report.py
+
+# Legacy ESC/RARC Report
 python zendeskreport_opentickets_esc-rarc_bidaily.py
 ```
 
-The script writes an Excel report to `/tmp/IT_Ops_Tag_Report_<timestamp>.xlsx` and optionally uploads it to Google Drive when `GDRIVE_SERVICE_ACCOUNT_JSON` and `GDRIVE_FOLDER_ID` are set.
+Reports are written to `/tmp/` and optionally uploaded to Google Drive.
 
-## GitHub Actions Workflows
+## GitHub Actions
 
-This repository uses GitHub Actions to automate report generation. The workflow is located in `.github/workflows/` and includes:
+The workflow in `.github/workflows/zendeskreport_esc-rarc.yml` runs the legacy ESC/RARC report. It is triggered via `workflow_dispatch` — either manually from the Actions tab or externally via cron-job.org hitting the GitHub API at 8:00 AM and 4:00 PM Pacific, Mon–Fri.
 
-- **zendeskreport_esc-rarc.yml**: 
-	- **Purpose:** Generates an ESC/RARC open ticket report.
-	- **Triggers:**
-		- Manual runs via the Actions tab.
-		- External automation can dispatch `workflow_dispatch` to run on a schedule.
-	- **Steps:**
-		1. Checks out the repository.
-		2. Sets up Python 3.11.
-		3. Installs dependencies from `requirements.txt`.
-		4. Runs the report script with required secrets.
-		5. Uploads the generated report as an artifact.
+All credentials are stored as repository secrets under Settings > Secrets and variables > Actions.
 
-The workflow uses repository secrets to securely provide credentials and optional upload configuration. Artifacts generated by the workflow are retained for 30 days.
+## ESC/RARC Classification
 
-## Required GitHub Actions Secrets
+**ESC (Escalation)** — ticket is blocked on an external actor. Matched when comments mention: blocked on, waiting on Ryan/Kurt/Dev/Leadership, needs approval, escalation, business/leadership decision, or Ryan/Kurt by name. On-hold tickets default to ESC.
 
-To run the workflow and script, the following GitHub Actions secrets must be configured in your repository:
-
-- `ZENDESK_EMAIL`: Your Zendesk login email (required)
-- `ZENDESK_TOKEN`: Zendesk API token (required)
-- `ANTHROPIC_API_KEY`: Anthropic API key (optional; enables draft reply suggestions when the `anthropic` package is installed)
-- `GDRIVE_SERVICE_ACCOUNT_JSON`: Google service account or OAuth JSON (optional, for Google Drive uploads)
-- `GDRIVE_FOLDER_ID`: Target Google Drive folder ID (optional, for Google Drive uploads)
-
-Set these secrets in your repository’s Settings > Secrets and variables > Actions. The workflow and script will fail if the required Zendesk secrets are missing.
-
-## Data Sources
-
-- Input: Zendesk API
-- Output: Generated Excel report artifacts (`/tmp/IT_Ops_Tag_Report_<timestamp>.xlsx`)
-
-## Contributing
-
-- Pull requests are welcome! Please open an issue first to discuss changes.
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
+**RARC (Ready to Close)** — IT Ops has resolved the issue and is waiting for requester confirmation. Matched when the last IT Ops comment contains: please confirm, let me know if, can we close, please verify, good to go/close, and no requester reply has been received since.
 
 ## Contact
 
-For questions or support, contact [cvee@cloudsecurityalliance.org].
-
-## Acknowledgments
-
-- Zendesk API
-- Contributors and open-source libraries
+Catherine Vee — cvee@cloudsecurityalliance.org

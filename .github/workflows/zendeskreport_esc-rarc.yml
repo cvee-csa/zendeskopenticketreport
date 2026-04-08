@@ -1,9 +1,9 @@
-name:  Zendesk Report for ESC/RARC Open Tickets 
+name: SLA Breach Report
 
 on:
   # Schedule is driven externally via cron-job.org hitting the workflow_dispatch
   # API endpoint — more reliable than GitHub's built-in schedule trigger.
-  # Target times: 8:00 AM and 4:00 PM Pacific, Mon–Fri.
+  # Target times: 8:00 AM and 4:00 PM Pacific, Mon-Fri.
   # API endpoint to call:
   #   POST https://api.github.com/repos/cvee-csa/zendeskopenticketreport/actions/workflows/zendeskreport_esc-rarc.yml/dispatches
   #   Body: {"ref": "main"}
@@ -28,23 +28,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate report
+      - name: Generate SLA breach report
         env:
           ZENDESK_EMAIL: ${{ secrets.ZENDESK_EMAIL }}
           ZENDESK_TOKEN: ${{ secrets.ZENDESK_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          DRY_RUN: "true"
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          # Email is optional — add these secrets later to enable delivery
-          # GMAIL_FROM:         ${{ secrets.GMAIL_FROM }}
-          # GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          # GMAIL_TO:           ${{ secrets.GMAIL_TO }}
-        run: python zendeskreport_opentickets_esc-rarc_bidaily.py
+        run: python sla_breach_report.py
 
       - name: Upload report as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: IT_Ops_Tag_Report_${{ github.run_id }}
-          path: /tmp/IT_Ops_Tag_Report_*.xlsx
+          name: IT_Ops_SLA_Report_${{ github.run_id }}
+          path: /tmp/IT_Ops_SLA_Report_*.xlsx
           retention-days: 30
