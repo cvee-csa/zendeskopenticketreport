@@ -167,6 +167,10 @@ def check_sla(ticket: dict, comments: list) -> dict:
 
     flags = []
     severity = "ok"
+    no_resp_h = None
+    unanswered_h = None
+    stale_h = None
+    age_days = None
 
     # 1. Initial response: first IT Ops comment within 2 biz hrs
     if created_at:
@@ -175,11 +179,14 @@ def check_sla(ticket: dict, comments: list) -> dict:
             if first_resp_dt:
                 hrs = _biz_hours_between(created_at, first_resp_dt)
                 if hrs > SLA_INITIAL_RESPONSE_HRS:
+                    unanswered_h = int(hrs)
                     flags.append(f"1st response: {hrs:.0f}h (>{SLA_INITIAL_RESPONSE_HRS}h)")
                     severity = "warn"
         else:
             hrs = _biz_hours_between(created_at, now)
             if hrs > SLA_INITIAL_RESPONSE_HRS:
+                no_resp_h = int(hrs)
+                unanswered_h = int(hrs)
                 flags.append(f"No response: {hrs:.0f}h")
                 severity = "alert"
 
@@ -193,6 +200,7 @@ def check_sla(ticket: dict, comments: list) -> dict:
             if not answered and req_dt:
                 hrs = _biz_hours_between(req_dt, now)
                 if hrs > SLA_REQUESTER_WAIT_HRS:
+                    unanswered_h = int(hrs)
                     flags.append(f"Unanswered: {hrs:.0f}h (>{SLA_REQUESTER_WAIT_HRS}h)")
                     severity = "alert"
 
@@ -200,6 +208,7 @@ def check_sla(ticket: dict, comments: list) -> dict:
     if updated_at:
         hrs = _biz_hours_between(updated_at, now)
         if hrs > SLA_NO_UPDATE_HRS:
+            stale_h = int(hrs)
             flags.append(f"Stale: {hrs:.0f}h (>{SLA_NO_UPDATE_HRS}h)")
             if severity == "ok":
                 severity = "warn"
@@ -209,11 +218,16 @@ def check_sla(ticket: dict, comments: list) -> dict:
         open_hrs = _biz_hours_between(created_at, now)
         open_days = open_hrs / 8
         if open_days > SLA_RESOLUTION_DAYS:
+            age_days = int(open_days)
             flags.append(f"Age: {open_days:.0f}d")
 
     display = " | ".join(flags) if flags else "OK"
     breached = severity in ("warn", "alert")
-    return {"breached": breached, "flags": flags, "display": display, "severity": severity}
+    return {
+        "breached": breached, "flags": flags, "display": display, "severity": severity,
+        "no_resp_h": no_resp_h, "unanswered_h": unanswered_h,
+        "stale_h": stale_h, "age_days": age_days,
+    }
 
 
 # ── Ryan tracking ───────────────────────────────────────────────────────────
@@ -325,44 +339,60 @@ def classify_esc_rarc(ticket: dict, comments: list) -> str:
     return ""
 
 
+RYAN_SLACK_HANDLE = "ryanbergsma"
+
+# Follow-up date: 3 business days from now
+_follow_up = _now + timedelta(days=3)
+while _follow_up.weekday() >= 5:            # skip weekends
+    _follow_up += timedelta(days=1)
+FOLLOW_UP_DATE = _follow_up.strftime("%Y-%m-%d")
+
+
 def build_claude_prompt(ticket_id: int, subject: str, tag: str,
                         next_step: str, sla_display: str) -> str:
-    """Build a ticket-specific Claude prompt for automation."""
+    """Build a copy-paste-ready Claude prompt for ticket automation.
+
+    Each prompt:
+      - Opens with 'Use the connected Zendesk tools.'
+      - Uses 'First … Then …' for multi-step actions
+      - Tags Ryan by @name in Zendesk notes, @handle in Slack DMs
+      - Includes specific context about what the requester needs
+      - Replaces vague 'check back in 3 days' with a concrete date
+    """
+    ZD = "Use the connected Zendesk tools."
     parts = []
 
     # 1. Apply ESC or RARC tag
     if tag == "esc":
-        parts.append(
-            f'Apply the "esc" tag to Zendesk ticket #{ticket_id} '
-            f'using the Zendesk API (PUT /api/v2/tickets/{ticket_id}) '
-            f'— add "esc" to the ticket\'s tags array. '
-            f'This ticket needs escalation.'
-        )
+        parts.append(f'add the "esc" tag to ticket #{ticket_id}')
     elif tag == "rarc":
-        parts.append(
-            f'Apply the "rarc" tag to Zendesk ticket #{ticket_id} '
-            f'using the Zendesk API (PUT /api/v2/tickets/{ticket_id}) '
-            f'— add "rarc" to the ticket\'s tags array. '
-            f'This ticket is ready to close pending requester confirmation.'
-        )
+        parts.append(f'add the "rarc" tag to ticket #{ticket_id}')
 
     # 2. Next step action
     if next_step == "Tag Ryan in ticket":
         parts.append(
-            f'Add an internal note to Zendesk ticket #{ticket_id} tagging '
-            f'Ryan Bergsma for review. The ticket "{subject}" needs his attention. '
-            f'SLA status: {sla_display}.'
+            f'add an internal note to ticket #{ticket_id}: '
+            f'"@Ryan Bergsma — {subject}. SLA: {sla_display}. '
+            f'Can you review and action this?"'
+        )
+    elif next_step == "Slack Ryan ticket URL":
+        parts.append(
+            f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} — {subject}. '
+            f'SLA: {sla_display}. Can you follow up?"'
         )
     elif next_step == "Allow time to respond":
         parts.append(
-            f'No action needed yet for ticket #{ticket_id} — Ryan was recently tagged. '
-            f'Check back if no response within 3 business days.'
+            f'No other action — Ryan was recently tagged. '
+            f'Follow up manually if no response by {FOLLOW_UP_DATE}.'
         )
 
     if not parts:
         return ""
 
-    return " ".join(parts)
+    # Sequence with First/Then if multiple actions
+    if len(parts) == 1:
+        return f"{ZD} {parts[0][0].upper()}{parts[0][1:]}"
+    return f"{ZD} First, {parts[0]}. Then {parts[1]}"
 
 
 # ── Spreadsheet builder — CSA Brand Colors ─────────────────────────────────
@@ -382,8 +412,9 @@ OK_ALT_BG     = "D6E8F4"   # slightly deeper blue alt
 LINK_COLOR    = CSA_BLUE
 SUMMARY_BG    = CSA_LIGHT
 
-HEADERS = ["Ticket #", "Subject", "SLA", "Ryan", "Next Step", "Status", "Claude Prompt"]
-WIDTHS = [10, 40, 34, 18, 24, 10, 50]
+HEADERS = ["Ticket #", "Subject", "SLA", "No Resp (h)", "Unans. (h)",
+           "Stale (h)", "Age", "Ryan", "Next Step", "Status", "Claude Prompt"]
+WIDTHS = [10, 40, 10, 12, 12, 10, 8, 18, 24, 10, 50]
 
 SEVERITY_STYLE = {
     "alert": {"bg": "FBDCDC", "fc": "B71C1C", "label": "BREACH"},
@@ -421,64 +452,83 @@ def write_report(rows: list[dict], output_path: str):
     """Build the styled SLA breach report spreadsheet."""
     wb = Workbook()
 
-    # ── Main sheet: All Tickets ──────────────────────────────────────────
-    ws = wb.active
-    ws.title = "All Open Tickets"
-
-    # Summary stats at top
     total = len(rows)
     breached = sum(1 for r in rows if r["sla_breached"])
     alerts = sum(1 for r in rows if r["sla_severity"] == "alert")
     warnings = sum(1 for r in rows if r["sla_severity"] == "warn")
+    within_sla = total - breached
     ryan_involved = sum(1 for r in rows if r["ryan_found"])
     action_needed = sum(1 for r in rows if r["next_step"])
 
-    summary_items = [
-        ("Open Tickets:",     str(total),          CSA_NAVY),
-        ("SLA Breaches:",     str(breached),        "B71C1C"),
-        ("  Alerts:",         str(alerts),          "B71C1C"),
-        ("  Warnings:",       str(warnings),        "856404"),
-        ("Ryan Involved:",    str(ryan_involved),   CSA_BLUE),
-        ("Action Needed:",    str(action_needed),   "B71C1C"),
-    ]
-    for sr, (label, val, color) in enumerate(summary_items, 1):
-        c = ws.cell(row=sr, column=1, value=label)
-        c.font = Font(name="Arial", bold=True, size=12, color=color)
-        c.fill = PatternFill("solid", start_color=SUMMARY_BG)
-        c.alignment = Alignment(horizontal="right", vertical="center")
-        c2 = ws.cell(row=sr, column=2, value=int(val))
-        c2.font = Font(name="Arial", bold=True, size=14, color=color)
-        c2.fill = PatternFill("solid", start_color=SUMMARY_BG)
-        c2.alignment = Alignment(horizontal="left", vertical="center")
-        for col in range(3, len(HEADERS) + 1):
-            sc = ws.cell(row=sr, column=col)
-            sc.fill = PatternFill("solid", start_color=SUMMARY_BG)
-
-    spacer_row = len(summary_items) + 1
-    ws.row_dimensions[spacer_row].height = 6
-
-    # Header row
-    HEADER_ROW = spacer_row + 1
-    for ci, (h, w) in enumerate(zip(HEADERS, WIDTHS), 1):
-        c = ws.cell(row=HEADER_ROW, column=ci, value=h)
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-        c.fill = PatternFill("solid", start_color=DARK_HEADER)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = _border()
-        ws.column_dimensions[get_column_letter(ci)].width = w
-    ws.row_dimensions[HEADER_ROW].height = 24
-
-    # Data rows — breached tickets first, then OK tickets
     sorted_rows = sorted(rows, key=lambda r: (
         0 if r["sla_severity"] == "alert" else 1 if r["sla_severity"] == "warn" else 2,
         -r["days_open"],
     ))
 
+    # ── Summary sheet (stats only — no ticket list) ──────────────────────
+    es = wb.active
+    es.title = "Summary"
+
+    es.merge_cells("A1:E1")
+    title_cell = es.cell(row=1, column=1, value=f"IT Ops SLA Breach Report — {TODAY}")
+    title_cell.font = Font(name="Arial", bold=True, size=16, color=DARK_HEADER)
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    es.row_dimensions[1].height = 32
+
+    stats = [
+        ("Run Date",        _now.strftime("%Y-%m-%d %H:%M:%S"), CSA_NAVY),
+        ("Open Tickets",    total,                               CSA_NAVY),
+        ("SLA Breaches",    breached,                            "B71C1C"),
+        ("  — Alerts",      alerts,                              "B71C1C"),
+        ("  — Warnings",    warnings,                            "856404"),
+        ("Within SLA",      within_sla,                          CSA_NAVY),
+        ("Ryan Involved",   ryan_involved,                       CSA_BLUE),
+        ("Action Required", action_needed,                       "B71C1C"),
+    ]
+    rn = 3
+    for label, val, color in stats:
+        es.cell(row=rn, column=1, value=label).font = Font(
+            name="Arial", bold=True, size=11, color=CSA_DARK_TEXT)
+        v = es.cell(row=rn, column=2, value=val)
+        v.font = Font(name="Arial", bold=True, size=13, color=color)
+        v.alignment = Alignment(horizontal="left")
+        rn += 1
+
+    # SLA thresholds as a one-line footnote
+    rn += 1
+    footnote = (
+        f"SLA Thresholds: 1st Response {SLA_INITIAL_RESPONSE_HRS}h · "
+        f"Requester Wait {SLA_REQUESTER_WAIT_HRS}h · "
+        f"Stale {SLA_NO_UPDATE_HRS}h (1 day) · "
+        f"Resolution Flag {SLA_RESOLUTION_DAYS} days"
+    )
+    es.merge_cells(start_row=rn, start_column=1, end_row=rn, end_column=5)
+    es.cell(row=rn, column=1, value=footnote).font = Font(
+        name="Arial", size=9, italic=True, color="999999")
+
+    es.column_dimensions["A"].width = 16
+    es.column_dimensions["B"].width = 30
+
+    # ── All Open Tickets sheet (no stats block) ──────────────────────────
+    ws = wb.create_sheet("All Open Tickets")
+
+    # Header row at row 1
+    HEADER_ROW = 1
+    for ci, (h, w) in enumerate(zip(HEADERS, WIDTHS), 1):
+        c = ws.cell(row=HEADER_ROW, column=ci, value=h)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        c.fill = PatternFill("solid", start_color=DARK_HEADER)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _border()
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[HEADER_ROW].height = 24
+
+    # Data rows
     cur_row = HEADER_ROW + 1
     for r in sorted_rows:
-        breached = r["sla_breached"]
+        is_breached = r["sla_breached"]
         even = cur_row % 2 == 0
-        if breached:
+        if is_breached:
             bg = BREACH_BG if not even else BREACH_ALT_BG
         else:
             bg = OK_BG if not even else OK_ALT_BG
@@ -486,136 +536,99 @@ def write_report(rows: list[dict], output_path: str):
         sev = SEVERITY_STYLE[r["sla_severity"]]
 
         # Col 1: Ticket #
-        tid_cell = _cell(ws, cur_row, 1, r["ticket_id"], bold=True, fc=LINK_COLOR, bg=bg, align="center")
-        tid_cell.font = Font(name="Arial", bold=True, color=LINK_COLOR, underline="single", size=11)
+        tid_cell = _cell(ws, cur_row, 1, r["ticket_id"], bold=True,
+                         fc=LINK_COLOR, bg=bg, align="center")
+        tid_cell.font = Font(name="Arial", bold=True, color=LINK_COLOR,
+                             underline="single", size=11)
         tid_cell.hyperlink = r["ticket_url"]
 
         # Col 2: Subject
         _cell(ws, cur_row, 2, r["subject"], bg=bg, wrap=True)
 
-        # Col 3: SLA — badge + details merged into one cell
-        sla_text = f"{sev['label']} — {r['sla_display']}" if r["sla_display"] != "OK" else "OK"
-        _cell(ws, cur_row, 3, sla_text, bold=breached, fc=sev["fc"], bg=sev["bg"], wrap=True, size=10)
+        # Col 3: SLA Level (BREACH / WARNING / OK)
+        _cell(ws, cur_row, 3, sev["label"], bold=is_breached,
+              fc=sev["fc"], bg=sev["bg"], align="center", size=10)
 
-        # Col 4: Ryan — "5 days ago (04/02)" or "Never"
+        # Col 4: No Resp (h)
+        val = r["no_resp_h"]
+        _cell(ws, cur_row, 4, val, bold=val is not None,
+              fc=sev["fc"] if val else CSA_DARK_TEXT,
+              bg=sev["bg"] if val else bg, align="center")
+
+        # Col 5: Unanswered (h)
+        val = r["unanswered_h"]
+        _cell(ws, cur_row, 5, val, bold=val is not None,
+              fc=sev["fc"] if val else CSA_DARK_TEXT,
+              bg=sev["bg"] if val else bg, align="center")
+
+        # Col 6: Stale (h)
+        val = r["stale_h"]
+        _cell(ws, cur_row, 6, val, bold=val is not None,
+              fc=sev["fc"] if val else CSA_DARK_TEXT,
+              bg=sev["bg"] if val else bg, align="center")
+
+        # Col 7: Age (days)
+        val = r["age_days"]
+        age_text = f"{val}d" if val else None
+        _cell(ws, cur_row, 7, age_text, bold=val is not None,
+              fc=sev["fc"] if val else CSA_DARK_TEXT,
+              bg=sev["bg"] if val else bg, align="center")
+
+        # Col 8: Ryan
         ryan_days = r["ryan_days_ago"]
         if ryan_days is not None:
-            ryan_fc = CSA_NAVY if ryan_days <= 3 else "F57F17" if ryan_days <= 7 else "B71C1C"
-            ryan_text = f"{ryan_days}d ago ({r['ryan_date']})" if ryan_days > 0 else "Today"
-            _cell(ws, cur_row, 4, ryan_text, bold=True, fc=ryan_fc, bg=bg, align="center")
+            ryan_fc = (CSA_NAVY if ryan_days <= 3
+                       else "F57F17" if ryan_days <= 7
+                       else "B71C1C")
+            ryan_text = (f"{ryan_days}d ago ({r['ryan_date']})"
+                         if ryan_days > 0 else "Today")
+            _cell(ws, cur_row, 8, ryan_text, bold=True, fc=ryan_fc,
+                  bg=bg, align="center")
         else:
-            _cell(ws, cur_row, 4, "Never", fc="999999", bg=bg, align="center")
+            _cell(ws, cur_row, 8, "Never", fc="999999", bg=bg, align="center")
 
-        # Col 5: Next Step
+        # Col 9: Next Step
         step = r["next_step"]
         if step:
             ss = STEP_STYLE.get(step, {"bg": bg, "fc": CSA_DARK_TEXT})
-            _cell(ws, cur_row, 5, step, bold=True, fc=ss["fc"], bg=ss["bg"], wrap=True)
+            _cell(ws, cur_row, 9, step, bold=True, fc=ss["fc"],
+                  bg=ss["bg"], wrap=True)
         else:
-            _cell(ws, cur_row, 5, "—", fc=CSA_NAVY, bg=bg, align="center")
+            _cell(ws, cur_row, 9, "—", fc=CSA_NAVY, bg=bg, align="center")
 
-        # Col 6: Status (open/hold/pending)
-        _cell(ws, cur_row, 6, r["ticket_status"].capitalize(), bg=bg, align="center")
+        # Col 10: Status
+        _cell(ws, cur_row, 10, r["ticket_status"].capitalize(),
+              bg=bg, align="center")
 
-        # Col 7: Claude Prompt
+        # Col 11: Claude Prompt
         prompt = r.get("claude_prompt", "")
-        if prompt:
-            _cell(ws, cur_row, 7, prompt, bg=bg, wrap=True, size=9)
-        else:
-            _cell(ws, cur_row, 7, "", bg=bg)
+        _cell(ws, cur_row, 11, prompt if prompt else "",
+              bg=bg, wrap=True, size=9)
 
-        ws.row_dimensions[cur_row].height = 48
+        ws.row_dimensions[cur_row].height = 36
         cur_row += 1
 
     ws.freeze_panes = f"A{HEADER_ROW + 1}"
 
-    # ── Summary sheet ────────────────────────────────────────────────────
-    es = wb.create_sheet("Summary", 0)
-
-    es.row_dimensions[1].height = 16
-
-    es.merge_cells("A3:E3")
-    title_cell = es.cell(row=3, column=1, value=f"IT Ops SLA Breach Report — {TODAY}")
-    title_cell.font = Font(name="Arial", bold=True, size=16, color=DARK_HEADER)
-    title_cell.alignment = Alignment(horizontal="left", vertical="center")
-    es.row_dimensions[3].height = 32
-
-    stats = [
-        ("Run Date",           _now.strftime("%Y-%m-%d %H:%M:%S"), CSA_NAVY),
-        ("Open Tickets",       total,                               CSA_NAVY),
-        ("SLA Breaches",       breached,                            "B71C1C"),
-        ("  — Alerts",         alerts,                              "B71C1C"),
-        ("  — Warnings",       warnings,                            "856404"),
-        ("Within SLA",         total - breached,                    CSA_NAVY),
-        ("Ryan Involved",      ryan_involved,                       CSA_BLUE),
-        ("Action Required",    action_needed,                       "B71C1C"),
-    ]
-    rn = 5
-    for label, val, color in stats:
-        es.cell(row=rn, column=1, value=label).font = Font(name="Arial", bold=True, size=11, color=CSA_DARK_TEXT)
-        v = es.cell(row=rn, column=2, value=val)
-        v.font = Font(name="Arial", bold=True, size=13, color=color)
-        v.alignment = Alignment(horizontal="left")
-        rn += 1
-
-    # SLA thresholds reference
-    rn += 1
-    es.merge_cells(start_row=rn, start_column=1, end_row=rn, end_column=3)
-    sec = es.cell(row=rn, column=1, value="SLA Thresholds")
-    sec.font = Font(name="Arial", bold=True, size=12, color=DARK_HEADER)
-    rn += 1
+    # ── SLA Reference sheet ──────────────────────────────────────────────
+    ref = wb.create_sheet("SLA Reference")
+    ref.cell(row=1, column=1, value="SLA Thresholds").font = Font(
+        name="Arial", bold=True, size=14, color=CSA_NAVY)
+    ref.row_dimensions[1].height = 24
 
     thresholds = [
-        ("First Response",   f"{SLA_INITIAL_RESPONSE_HRS} business hours"),
-        ("Requester Wait",   f"{SLA_REQUESTER_WAIT_HRS} business hours"),
-        ("Stale Ticket",     f"{SLA_NO_UPDATE_HRS} business hours (1 day)"),
-        ("Resolution Flag",  f"{SLA_RESOLUTION_DAYS} business days"),
+        ("First Response",  f"{SLA_INITIAL_RESPONSE_HRS} business hours"),
+        ("Requester Wait",  f"{SLA_REQUESTER_WAIT_HRS} business hours"),
+        ("Stale Ticket",    f"{SLA_NO_UPDATE_HRS} business hours (1 day)"),
+        ("Resolution Flag", f"{SLA_RESOLUTION_DAYS} business days"),
     ]
-    for label, val in thresholds:
-        es.cell(row=rn, column=1, value=label).font = Font(name="Arial", size=10, color="666666")
-        es.cell(row=rn, column=2, value=val).font = Font(name="Arial", size=10, color=CSA_DARK_TEXT)
-        rn += 1
-
-    # Action needed table
-    action_rows = [r for r in sorted_rows if r["next_step"]]
-    if action_rows:
-        rn += 1
-        es.merge_cells(start_row=rn, start_column=1, end_row=rn, end_column=4)
-        sec = es.cell(row=rn, column=1, value=f"Action Required ({len(action_rows)} tickets)")
-        sec.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
-        sec.fill = PatternFill("solid", start_color=CSA_NAVY)
-        sec.alignment = Alignment(horizontal="left", vertical="center")
-        es.row_dimensions[rn].height = 24
-        rn += 1
-
-        act_headers = ["#", "Subject", "Next Step", "Ryan"]
-        act_widths = [10, 44, 24, 18]
-        for ci, (h, w) in enumerate(zip(act_headers, act_widths), 1):
-            c = es.cell(row=rn, column=ci, value=h)
-            c.font = Font(name="Arial", bold=True, size=10, color="666666")
-            c.border = _border()
-            es.column_dimensions[get_column_letter(ci)].width = w
-        rn += 1
-
-        for r in action_rows:
-            tid_cell = es.cell(row=rn, column=1, value=r["ticket_id"])
-            tid_cell.font = Font(name="Arial", color=LINK_COLOR, underline="single", size=11)
-            tid_cell.hyperlink = r["ticket_url"]
-            tid_cell.border = _border()
-
-            es.cell(row=rn, column=2, value=r["subject"]).border = _border()
-
-            step_cell = es.cell(row=rn, column=3, value=r["next_step"])
-            ss = STEP_STYLE.get(r["next_step"], {"fc": CSA_DARK_TEXT})
-            step_cell.font = Font(name="Arial", bold=True, color=ss["fc"], size=11)
-            step_cell.border = _border()
-
-            ryan_days = r["ryan_days_ago"]
-            ryan_txt = f"{ryan_days}d ago" if ryan_days is not None and ryan_days > 0 else "Today" if ryan_days == 0 else "Never"
-            es.cell(row=rn, column=4, value=ryan_txt).border = _border()
-
-            es.row_dimensions[rn].height = 28
-            rn += 1
+    for i, (label, val) in enumerate(thresholds, 3):
+        ref.cell(row=i, column=1, value=label).font = Font(
+            name="Arial", bold=True, size=11, color=CSA_DARK_TEXT)
+        ref.cell(row=i, column=2, value=val).font = Font(
+            name="Arial", size=11, color=CSA_DARK_TEXT)
+    ref.column_dimensions["A"].width = 20
+    ref.column_dimensions["B"].width = 28
 
     wb.save(output_path)
     print(f"  Report saved: {output_path} ({len(rows)} tickets)")
@@ -707,6 +720,10 @@ def main():
             "sla_breached":  sla["breached"],
             "sla_severity":  sla["severity"],
             "sla_display":   sla["display"],
+            "no_resp_h":     sla["no_resp_h"],
+            "unanswered_h":  sla["unanswered_h"],
+            "stale_h":       sla["stale_h"],
+            "age_days":      sla["age_days"],
             "ryan_found":    ryan["found"],
             "ryan_date":     ryan["date"],
             "ryan_days_ago": ryan["days_ago"],
