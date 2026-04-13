@@ -124,6 +124,28 @@ def fetch_comments(ticket_id):
     return []
 
 
+def fetch_users(user_ids: set) -> dict:
+    """Batch-fetch user display names. Returns {user_id: "Name"}."""
+    if not user_ids:
+        return {}
+    users = {}
+    ids_list = list(user_ids)
+    for i in range(0, len(ids_list), 100):          # ZD allows 100 per call
+        batch = ids_list[i:i + 100]
+        ids_param = ",".join(str(uid) for uid in batch)
+        url = f"{BASE_ZD}/users/show_many.json?ids={ids_param}"
+        for attempt in range(3):
+            r = requests.get(url, headers=_zd_headers(), timeout=30)
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 10)))
+                continue
+            if r.ok:
+                for u in r.json().get("users", []):
+                    users[u["id"]] = u.get("name", f"User #{u['id']}")
+                break
+    return users
+
+
 # ── SLA calculation ─────────────────────────────────────────────────────────
 def _biz_hours_between(start_utc: datetime, end_utc: datetime) -> float:
     """Count business hours (Mon-Fri, 09:00-17:00 Pacific) between two UTC datetimes."""
@@ -391,10 +413,13 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
     elif tag == "rarc":
         parts.append(f'add the "rarc" tag to ticket #{ticket_id}')
 
-    # Build context blurb: subject + issue summary
+    # Build context blurb: subject + issue summary (skip if near-duplicate)
     context = subject
-    if issue_summary and issue_summary.lower() != subject.lower():
-        context = f"{subject}. Issue: {issue_summary}"
+    if issue_summary:
+        subj_norm = subject.lower().strip().rstrip(".")
+        summ_norm = issue_summary.lower().strip().rstrip(".")
+        if subj_norm not in summ_norm and summ_norm not in subj_norm:
+            context = f"{subject}. Issue: {issue_summary}"
 
     # 2. Next step action
     if next_step == "Tag Ryan in ticket":
@@ -408,11 +433,8 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
             f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} — {context}. '
             f'Can you follow up?"'
         )
-    elif next_step == "Allow time to respond":
-        parts.append(
-            f'No other action — Ryan was recently tagged. '
-            f'Follow up manually if no response by {FOLLOW_UP_DATE}.'
-        )
+    # "Allow time to respond" — no Claude action; tag-only prompt is enough.
+    # The follow-up date is shown in the Next Step column instead.
 
     if not parts:
         return ""
@@ -440,9 +462,9 @@ OK_ALT_BG     = "D6E8F4"   # slightly deeper blue alt
 LINK_COLOR    = CSA_BLUE
 SUMMARY_BG    = CSA_LIGHT
 
-HEADERS = ["Ticket #", "Subject", "SLA", "No Resp (h)", "Unans. (h)",
-           "Stale (h)", "Age", "Ryan", "Next Step", "Status", "Claude Prompt"]
-WIDTHS = [10, 40, 10, 12, 12, 10, 8, 18, 24, 10, 50]
+HEADERS = ["Ticket #", "Subject", "Requester", "SLA", "SLA Detail",
+           "Ryan", "Next Step", "Status"]
+WIDTHS = [10, 40, 18, 10, 22, 18, 24, 10]
 
 SEVERITY_STYLE = {
     "alert": {"bg": "FBDCDC", "fc": "B71C1C", "label": "BREACH"},
@@ -485,7 +507,8 @@ def write_report(rows: list[dict], output_path: str):
     alerts = sum(1 for r in rows if r["sla_severity"] == "alert")
     warnings = sum(1 for r in rows if r["sla_severity"] == "warn")
     within_sla = total - breached
-    ryan_involved = sum(1 for r in rows if r["ryan_found"])
+    ryan_owner = sum(1 for r in rows if r.get("ryan_status") == "Owner")
+    ryan_tagged = sum(1 for r in rows if r.get("ryan_status") == "Tagged")
     action_needed = sum(1 for r in rows if r["next_step"])
 
     sorted_rows = sorted(rows, key=lambda r: (
@@ -493,7 +516,7 @@ def write_report(rows: list[dict], output_path: str):
         -r["days_open"],
     ))
 
-    # ── Summary sheet (stats only — no ticket list) ──────────────────────
+    # ── Summary sheet ────────────────────────────────────────────────
     es = wb.active
     es.title = "Summary"
 
@@ -504,14 +527,15 @@ def write_report(rows: list[dict], output_path: str):
     es.row_dimensions[1].height = 32
 
     stats = [
-        ("Run Date",        _now.strftime("%Y-%m-%d %H:%M:%S"), CSA_NAVY),
-        ("Open Tickets",    total,                               CSA_NAVY),
-        ("SLA Breaches",    breached,                            "B71C1C"),
-        ("  — Alerts",      alerts,                              "B71C1C"),
-        ("  — Warnings",    warnings,                            "856404"),
-        ("Within SLA",      within_sla,                          CSA_NAVY),
-        ("Ryan Involved",   ryan_involved,                       CSA_BLUE),
-        ("Action Required", action_needed,                       "B71C1C"),
+        ("Run Date",          _now.strftime("%Y-%m-%d %H:%M:%S"), CSA_NAVY),
+        ("Open Tickets",      total,                               CSA_NAVY),
+        ("SLA Breaches",      breached,                            "B71C1C"),
+        ("  — Alerts",        alerts,                              "B71C1C"),
+        ("  — Warnings",      warnings,                            "856404"),
+        ("Within SLA",        within_sla,                          CSA_NAVY),
+        ("Ryan — Owner",      ryan_owner,                          CSA_BLUE),
+        ("Ryan — Tagged",     ryan_tagged,                         CSA_BLUE),
+        ("Action Required",   action_needed,                       "B71C1C"),
     ]
     rn = 3
     for label, val, color in stats:
@@ -534,13 +558,12 @@ def write_report(rows: list[dict], output_path: str):
     es.cell(row=rn, column=1, value=footnote).font = Font(
         name="Arial", size=9, italic=True, color="999999")
 
-    es.column_dimensions["A"].width = 16
+    es.column_dimensions["A"].width = 18
     es.column_dimensions["B"].width = 30
 
-    # ── All Open Tickets sheet (no stats block) ──────────────────────────
+    # ── All Open Tickets sheet ────────────────────────────────────────
     ws = wb.create_sheet("All Open Tickets")
 
-    # Header row at row 1
     HEADER_ROW = 1
     for ci, (h, w) in enumerate(zip(HEADERS, WIDTHS), 1):
         c = ws.cell(row=HEADER_ROW, column=ci, value=h)
@@ -551,16 +574,12 @@ def write_report(rows: list[dict], output_path: str):
         ws.column_dimensions[get_column_letter(ci)].width = w
     ws.row_dimensions[HEADER_ROW].height = 24
 
-    # Data rows
     cur_row = HEADER_ROW + 1
     for r in sorted_rows:
         is_breached = r["sla_breached"]
         even = cur_row % 2 == 0
-        if is_breached:
-            bg = BREACH_BG if not even else BREACH_ALT_BG
-        else:
-            bg = OK_BG if not even else OK_ALT_BG
-
+        bg = (BREACH_BG if not even else BREACH_ALT_BG) if is_breached \
+            else (OK_BG if not even else OK_ALT_BG)
         sev = SEVERITY_STYLE[r["sla_severity"]]
 
         # Col 1: Ticket #
@@ -573,43 +592,27 @@ def write_report(rows: list[dict], output_path: str):
         # Col 2: Subject
         _cell(ws, cur_row, 2, r["subject"], bg=bg, wrap=True)
 
-        # Col 3: SLA Level (BREACH / WARNING / OK)
-        _cell(ws, cur_row, 3, sev["label"], bold=is_breached,
+        # Col 3: Requester
+        _cell(ws, cur_row, 3, r.get("requester_name", ""), bg=bg, wrap=True)
+
+        # Col 4: SLA Level
+        _cell(ws, cur_row, 4, sev["label"], bold=is_breached,
               fc=sev["fc"], bg=sev["bg"], align="center", size=10)
 
-        # Col 4: No Resp (h)
-        val = r["no_resp_h"]
-        _cell(ws, cur_row, 4, val, bold=val is not None,
-              fc=sev["fc"] if val else CSA_DARK_TEXT,
-              bg=sev["bg"] if val else bg, align="center")
+        # Col 5: SLA Detail (single worst metric)
+        detail = r.get("sla_detail", "")
+        _cell(ws, cur_row, 5, detail, bold=bool(detail),
+              fc=sev["fc"] if detail else CSA_DARK_TEXT,
+              bg=sev["bg"] if detail else bg, wrap=True, size=10)
 
-        # Col 5: Unanswered (h)
-        val = r["unanswered_h"]
-        _cell(ws, cur_row, 5, val, bold=val is not None,
-              fc=sev["fc"] if val else CSA_DARK_TEXT,
-              bg=sev["bg"] if val else bg, align="center")
-
-        # Col 6: Stale (h)
-        val = r["stale_h"]
-        _cell(ws, cur_row, 6, val, bold=val is not None,
-              fc=sev["fc"] if val else CSA_DARK_TEXT,
-              bg=sev["bg"] if val else bg, align="center")
-
-        # Col 7: Age (days)
-        val = r["age_days"]
-        age_text = f"{val}d" if val else None
-        _cell(ws, cur_row, 7, age_text, bold=val is not None,
-              fc=sev["fc"] if val else CSA_DARK_TEXT,
-              bg=sev["bg"] if val else bg, align="center")
-
-        # Col 8: Ryan — status flag (Owner / Tagged Xd / —)
+        # Col 6: Ryan status
         ryan_status = r.get("ryan_status", "")
         ryan_days = r["ryan_days_ago"]
         if ryan_status == "Owner":
             ryan_text = "Owner"
             if ryan_days is not None and ryan_days > 0:
                 ryan_text += f" (tagged {ryan_days}d)"
-            _cell(ws, cur_row, 8, ryan_text, bold=True, fc=CSA_BLUE,
+            _cell(ws, cur_row, 6, ryan_text, bold=True, fc=CSA_BLUE,
                   bg=bg, align="center")
         elif ryan_status == "Tagged":
             ryan_text = "Tagged"
@@ -620,33 +623,66 @@ def write_report(rows: list[dict], output_path: str):
             ryan_fc = (CSA_NAVY if ryan_days is not None and ryan_days <= 3
                        else "F57F17" if ryan_days is not None and ryan_days <= 7
                        else "B71C1C")
-            _cell(ws, cur_row, 8, ryan_text, bold=True, fc=ryan_fc,
+            _cell(ws, cur_row, 6, ryan_text, bold=True, fc=ryan_fc,
                   bg=bg, align="center")
         else:
-            _cell(ws, cur_row, 8, "—", fc="999999", bg=bg, align="center")
+            _cell(ws, cur_row, 6, "—", fc="999999", bg=bg, align="center")
 
-        # Col 9: Next Step
+        # Col 7: Next Step (show follow-up date for "Allow time" rows)
         step = r["next_step"]
-        if step:
+        if step == "Allow time to respond":
+            step_text = f"Wait (follow up {FOLLOW_UP_DATE})"
+            _cell(ws, cur_row, 7, step_text, bold=True, fc=CSA_NAVY,
+                  bg=CSA_LIGHT, wrap=True, size=10)
+        elif step:
             ss = STEP_STYLE.get(step, {"bg": bg, "fc": CSA_DARK_TEXT})
-            _cell(ws, cur_row, 9, step, bold=True, fc=ss["fc"],
+            _cell(ws, cur_row, 7, step, bold=True, fc=ss["fc"],
                   bg=ss["bg"], wrap=True)
         else:
-            _cell(ws, cur_row, 9, "—", fc=CSA_NAVY, bg=bg, align="center")
+            _cell(ws, cur_row, 7, "—", fc=CSA_NAVY, bg=bg, align="center")
 
-        # Col 10: Status
-        _cell(ws, cur_row, 10, r["ticket_status"].capitalize(),
+        # Col 8: Status
+        _cell(ws, cur_row, 8, r["ticket_status"].capitalize(),
               bg=bg, align="center")
-
-        # Col 11: Claude Prompt
-        prompt = r.get("claude_prompt", "")
-        _cell(ws, cur_row, 11, prompt if prompt else "",
-              bg=bg, wrap=True, size=9)
 
         ws.row_dimensions[cur_row].height = 36
         cur_row += 1
 
     ws.freeze_panes = f"A{HEADER_ROW + 1}"
+
+    # ── Claude Prompts sheet (full-width, no truncation) ────────────────
+    prompt_rows = [r for r in sorted_rows if r.get("claude_prompt")]
+    if prompt_rows:
+        ps = wb.create_sheet("Claude Prompts")
+        p_headers = ["Ticket #", "Subject", "Next Step", "Claude Prompt"]
+        p_widths  = [10, 36, 22, 90]
+        for ci, (h, w) in enumerate(zip(p_headers, p_widths), 1):
+            c = ps.cell(row=1, column=ci, value=h)
+            c.font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+            c.fill = PatternFill("solid", start_color=DARK_HEADER)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.border = _border()
+            ps.column_dimensions[get_column_letter(ci)].width = w
+        ps.row_dimensions[1].height = 24
+
+        pr = 2
+        for r in prompt_rows:
+            tid_cell = _cell(ps, pr, 1, r["ticket_id"], bold=True,
+                             fc=LINK_COLOR, align="center")
+            tid_cell.font = Font(name="Arial", bold=True, color=LINK_COLOR,
+                                 underline="single", size=11)
+            tid_cell.hyperlink = r["ticket_url"]
+
+            _cell(ps, pr, 2, r["subject"], wrap=True)
+            _cell(ps, pr, 3, r["next_step"] or "—", wrap=True, size=10)
+            _cell(ps, pr, 4, r["claude_prompt"], wrap=True, size=10)
+
+            # Dynamic row height based on prompt length
+            chars = len(r["claude_prompt"])
+            ps.row_dimensions[pr].height = max(36, min(100, chars // 2))
+            pr += 1
+
+        ps.freeze_panes = "A2"
 
     # ── SLA Reference sheet ──────────────────────────────────────────────
     ref = wb.create_sheet("SLA Reference")
@@ -717,6 +753,11 @@ def main():
         print("  No tickets found. Exiting.")
         return
 
+    # 1b. Batch-fetch requester names
+    requester_ids = {t.get("requester_id") for t in tickets if t.get("requester_id")}
+    print(f"  Fetching {len(requester_ids)} requester names...")
+    user_names = fetch_users(requester_ids)
+
     # 2. Analyze each ticket
     print(f"\n[2/3] Analyzing {len(tickets)} tickets...")
     rows = []
@@ -762,26 +803,40 @@ def main():
         if created_at:
             days_open = _biz_hours_between(created_at, datetime.now(timezone.utc)) / 8
 
+        # SLA detail — single worst metric for triage scanning
+        if sla["no_resp_h"]:
+            sla_detail = f"No response {sla['no_resp_h']}h"
+        elif sla["unanswered_h"]:
+            sla_detail = f"Unanswered {sla['unanswered_h']}h"
+        elif sla["stale_h"]:
+            sla_detail = f"Stale {sla['stale_h']}h"
+        elif sla["age_days"]:
+            sla_detail = f"{sla['age_days']}d old"
+        else:
+            sla_detail = ""
+
+        # Requester name
+        req_id = ticket.get("requester_id")
+        requester_name = user_names.get(req_id, "") if req_id else ""
+
         rows.append({
-            "ticket_id":     tid,
-            "ticket_url":    f"{TICKET_URL}{tid}",
-            "subject":       subject,
-            "ticket_status": ticket.get("status", ""),
-            "days_open":     days_open,
-            "sla_breached":  sla["breached"],
-            "sla_severity":  sla["severity"],
-            "sla_display":   sla["display"],
-            "no_resp_h":     sla["no_resp_h"],
-            "unanswered_h":  sla["unanswered_h"],
-            "stale_h":       sla["stale_h"],
-            "age_days":      sla["age_days"],
-            "ryan_found":    ryan["found"],
-            "ryan_date":     ryan["date"],
-            "ryan_days_ago": ryan["days_ago"],
-            "ryan_status":   ryan_status,
-            "next_step":     next_step,
-            "tag":           tag,
-            "claude_prompt": claude_prompt,
+            "ticket_id":      tid,
+            "ticket_url":     f"{TICKET_URL}{tid}",
+            "subject":        subject,
+            "requester_name": requester_name,
+            "ticket_status":  ticket.get("status", ""),
+            "days_open":      days_open,
+            "sla_breached":   sla["breached"],
+            "sla_severity":   sla["severity"],
+            "sla_display":    sla["display"],
+            "sla_detail":     sla_detail,
+            "ryan_found":     ryan["found"],
+            "ryan_date":      ryan["date"],
+            "ryan_days_ago":  ryan["days_ago"],
+            "ryan_status":    ryan_status,
+            "next_step":      next_step,
+            "tag":            tag,
+            "claude_prompt":  claude_prompt,
         })
 
     # 3. Build report
