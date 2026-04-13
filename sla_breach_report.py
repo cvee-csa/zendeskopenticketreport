@@ -364,7 +364,7 @@ def classify_esc_rarc(ticket: dict, comments: list) -> str:
 RYAN_SLACK_HANDLE = "ryanbergsma"
 
 
-def _summarize_issue(description: str, max_len: int = 120) -> str:
+def _summarize_issue(description: str, max_len: int = 250) -> str:
     """Extract a brief plain-text summary from a ticket description.
 
     Strips HTML tags, collapses whitespace, and truncates to *max_len*
