@@ -387,7 +387,7 @@ def _truncate(text: str, max_len: int) -> str:
 
 
 def _summarize_issue(description: str, comments: list = None,
-                     max_len: int = 500) -> str:
+                     max_len: int = 1000) -> str:
     """Build a concise issue summary from the ticket description and comments.
 
     Returns up to *max_len* characters combining:
