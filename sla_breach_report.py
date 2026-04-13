@@ -454,32 +454,37 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
     elif tag == "rarc":
         parts.append(f'add the "rarc" tag to ticket #{ticket_id}')
 
-    # Build context blurb: subject + issue summary (skip if near-duplicate)
+    # Strip trailing punctuation from subject for clean prompt text
     subj_clean = subject.rstrip(".!? ")
-    context = subj_clean
+
+    # Build issue detail: include summary only if it adds info beyond the subject
+    issue_detail = ""
     if issue_summary:
         subj_norm = subject.lower().strip().rstrip(".")
         summ_norm = issue_summary.lower().strip().rstrip(".")
         if subj_norm not in summ_norm and summ_norm not in subj_norm:
-            context = f"{subj_clean}. Issue: {issue_summary}"
+            issue_detail = issue_summary
 
     # 2. Next step action
     if next_step == "Tag Ryan in ticket":
+        note_lines = [f'@Ryan Bergsma — this ticket needs your attention.']
+        note_lines.append(f'\nSubject: {subj_clean}')
+        if issue_detail:
+            note_lines.append(f'Issue: {issue_detail}')
+        note_lines.append(f'\nCan you review and action this?')
+        note_msg = '\n'.join(note_lines)
         parts.append(
-            f'add an internal note to ticket #{ticket_id}: '
-            f'"@Ryan Bergsma — {context}. '
-            f'Can you review and action this?"'
+            f'add an internal note to ticket #{ticket_id} with this message:\n{note_msg}'
         )
     elif next_step == "Slack Ryan ticket URL":
         ticket_url = f"{TICKET_URL}{ticket_id}"
-        slack_msg = (f'Hey Ryan, ticket #{ticket_id} needs attention.\n\n'
-                     f'*Subject:* {subj_clean}\n')
-        if issue_summary:
-            subj_norm = subject.lower().strip().rstrip(".")
-            summ_norm = issue_summary.lower().strip().rstrip(".")
-            if subj_norm not in summ_norm and summ_norm not in subj_norm:
-                slack_msg += f'*Issue:* {issue_summary}\n'
-        slack_msg += f'*Link:* {ticket_url}\n\nCan you take a look?'
+        slack_lines = [f'Hey Ryan, ticket #{ticket_id} needs attention.']
+        slack_lines.append(f'\n*Subject:* {subj_clean}')
+        if issue_detail:
+            slack_lines.append(f'*Issue:* {issue_detail}')
+        slack_lines.append(f'*Link:* {ticket_url}')
+        slack_lines.append(f'\nCan you take a look?')
+        slack_msg = '\n'.join(slack_lines)
         parts.append(
             f'DM @{RYAN_SLACK_HANDLE} in Slack with this message:\n{slack_msg}'
         )
