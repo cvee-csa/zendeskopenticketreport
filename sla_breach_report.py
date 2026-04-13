@@ -364,33 +364,68 @@ def classify_esc_rarc(ticket: dict, comments: list) -> str:
 RYAN_SLACK_HANDLE = "ryanbergsma"
 
 
-def _summarize_issue(description: str, max_len: int = 500) -> str:
-    """Extract a brief plain-text summary from a ticket description.
-
-    Strips HTML tags, collapses whitespace, and truncates to *max_len*
-    characters so the Claude prompt gives Ryan context about the original
-    request rather than SLA numbers.
-    """
-    if not description:
+def _clean_text(raw: str) -> str:
+    """Strip HTML, markdown, invisible chars, and collapse whitespace."""
+    if not raw:
         return ""
-    # Strip HTML tags
-    text = re.sub(r"<[^>]+>", " ", description)
-    # Decode common HTML entities
+    text = re.sub(r"<[^>]+>", " ", raw)
     text = _html.unescape(text)
-    # Strip markdown bold/italic markers  (**bold**, *italic*, __bold__)
     text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
     text = re.sub(r"_{1,2}([^_]+)_{1,2}", r"\1", text)
-    # Remove zero-width / invisible Unicode characters
     text = re.sub(r"[\u200b\u200c\u200d\u200e\u200f\u034f\ufeff\u00ad\u2060"
                   r"\u2061\u2062\u2063\u2064\u180e]", "", text)
-    # Collapse whitespace, then fix space-before-punctuation
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
-    # Take the first sentence or max_len chars, whichever is shorter
+    return text
+
+
+def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     cut = text[:max_len].rsplit(" ", 1)[0]
-    return cut + "…" if cut else text[:max_len] + "…"
+    return (cut + "…") if cut else (text[:max_len] + "…")
+
+
+def _summarize_issue(description: str, comments: list = None,
+                     max_len: int = 500) -> str:
+    """Build a concise issue summary from the ticket description and comments.
+
+    Returns up to *max_len* characters combining:
+      - The original request (from description)
+      - The latest meaningful update (from the most recent non-trivial comment)
+    so Ryan gets both context and current state.
+    """
+    desc_clean = _clean_text(description)
+
+    # Find the last substantive comment (>40 chars, not auto-generated)
+    latest_update = ""
+    if comments:
+        for c in reversed(comments):
+            body = _clean_text(c.get("plain_body") or c.get("body") or "")
+            # Skip very short / auto-generated comments
+            if len(body) < 40:
+                continue
+            # Skip if it's basically the same as the description
+            if desc_clean and body[:80].lower() == desc_clean[:80].lower():
+                continue
+            latest_update = body
+            break
+
+    if not desc_clean and not latest_update:
+        return ""
+
+    # If there's a meaningful latest comment, include both parts
+    if latest_update and desc_clean:
+        # Budget: ~60% for description, ~40% for latest update
+        desc_budget = int(max_len * 0.6)
+        update_budget = max_len - desc_budget - 20  # 20 for separator
+        desc_part = _truncate(desc_clean, desc_budget)
+        update_part = _truncate(latest_update, update_budget)
+        return f"{desc_part} — Latest: {update_part}"
+    elif desc_clean:
+        return _truncate(desc_clean, max_len)
+    else:
+        return _truncate(latest_update, max_len)
 
 # Follow-up date: 3 business days from now
 _follow_up = _now + timedelta(days=3)
@@ -831,10 +866,10 @@ def main():
         # ESC/RARC classification
         tag = classify_esc_rarc(ticket, comments)
 
-        # Issue summary for Claude prompts (from ticket description)
+        # Issue summary for Claude prompts (from description + comments)
         subject = ticket.get("subject", "")
         description = ticket.get("description") or ""
-        issue_summary = _summarize_issue(description)
+        issue_summary = _summarize_issue(description, comments)
 
         # Ryan status: Owner / Tagged / —
         ryan_is_owner = ticket.get("assignee_id") == RYAN_ID
