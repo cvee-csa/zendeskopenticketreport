@@ -467,23 +467,45 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
 
     # 2. Next step action
     if next_step == "Tag Ryan in ticket":
-        note_lines = [f'@Ryan Bergsma — this ticket needs your attention.']
-        note_lines.append(f'\nSubject: {subj_clean}')
+        # Zendesk internal note — uses HTML bold for formatting
+        note_lines = [
+            f'<b>Automated Note from IT Ops SLA Breach Report</b>',
+            f'',
+            f'Hi @Ryan Bergsma — this ticket needs your attention.',
+            f'',
+            f'<b>Subject:</b> {subj_clean}',
+        ]
         if issue_detail:
-            note_lines.append(f'Issue: {issue_detail}')
-        note_lines.append(f'\nCan you review and action this?')
+            note_lines.append(f'<b>Issue:</b> {issue_detail}')
+        note_lines.extend([
+            f'',
+            f'Can you review and action this? Thank you!',
+            f'',
+            f'<i>This note was generated automatically by the IT Ops SLA Breach Report.</i>',
+        ])
         note_msg = '\n'.join(note_lines)
         parts.append(
             f'add an internal note to ticket #{ticket_id} with this message:\n{note_msg}'
         )
     elif next_step == "Slack Ryan ticket URL":
+        # Slack DM — uses Slack mrkdwn (* for bold, _ for italic)
         ticket_url = f"{TICKET_URL}{ticket_id}"
-        slack_lines = [f'Hey Ryan, ticket #{ticket_id} needs attention.']
-        slack_lines.append(f'\n*Subject:* {subj_clean}')
+        slack_lines = [
+            f'*IT Ops SLA Breach Report — Ticket #{ticket_id}*',
+            f'',
+            f'Hey Ryan, this ticket needs your attention.',
+            f'',
+            f'*Subject:* {subj_clean}',
+        ]
         if issue_detail:
             slack_lines.append(f'*Issue:* {issue_detail}')
-        slack_lines.append(f'*Link:* {ticket_url}')
-        slack_lines.append(f'\nCan you take a look?')
+        slack_lines.extend([
+            f'*Link:* {ticket_url}',
+            f'',
+            f'Can you take a look? Thanks!',
+            f'',
+            f'_Sent automatically by the IT Ops SLA Breach Report._',
+        ])
         slack_msg = '\n'.join(slack_lines)
         parts.append(
             f'DM @{RYAN_SLACK_HANDLE} in Slack with this message:\n{slack_msg}'
