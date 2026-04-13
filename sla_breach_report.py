@@ -364,7 +364,7 @@ def classify_esc_rarc(ticket: dict, comments: list) -> str:
 RYAN_SLACK_HANDLE = "ryanbergsma"
 
 
-def _summarize_issue(description: str, max_len: int = 250) -> str:
+def _summarize_issue(description: str, max_len: int = 500) -> str:
     """Extract a brief plain-text summary from a ticket description.
 
     Strips HTML tags, collapses whitespace, and truncates to *max_len*
@@ -437,9 +437,16 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
         )
     elif next_step == "Slack Ryan ticket URL":
         ticket_url = f"{TICKET_URL}{ticket_id}"
+        slack_msg = (f'Hey Ryan, ticket #{ticket_id} needs attention.\n\n'
+                     f'*Subject:* {subj_clean}\n')
+        if issue_summary:
+            subj_norm = subject.lower().strip().rstrip(".")
+            summ_norm = issue_summary.lower().strip().rstrip(".")
+            if subj_norm not in summ_norm and summ_norm not in subj_norm:
+                slack_msg += f'*Issue:* {issue_summary}\n'
+        slack_msg += f'*Link:* {ticket_url}\n\nCan you take a look?'
         parts.append(
-            f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} ({ticket_url}) — {context}. '
-            f'Can you follow up?"'
+            f'DM @{RYAN_SLACK_HANDLE} in Slack with this message:\n{slack_msg}'
         )
     # "Allow time to respond" — no Claude action; tag-only prompt is enough.
     # The follow-up date is shown in the Next Step column instead.
