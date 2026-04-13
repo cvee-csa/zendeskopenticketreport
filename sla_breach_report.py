@@ -377,6 +377,12 @@ def _summarize_issue(description: str, max_len: int = 120) -> str:
     text = re.sub(r"<[^>]+>", " ", description)
     # Decode common HTML entities
     text = _html.unescape(text)
+    # Strip markdown bold/italic markers  (**bold**, *italic*, __bold__)
+    text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
+    text = re.sub(r"_{1,2}([^_]+)_{1,2}", r"\1", text)
+    # Remove zero-width / invisible Unicode characters
+    text = re.sub(r"[\u200b\u200c\u200d\u200e\u200f\u034f\ufeff\u00ad\u2060"
+                  r"\u2061\u2062\u2063\u2064\u180e]", "", text)
     # Collapse whitespace, then fix space-before-punctuation
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+([.,;:!?])", r"\1", text)
@@ -414,12 +420,13 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
         parts.append(f'add the "rarc" tag to ticket #{ticket_id}')
 
     # Build context blurb: subject + issue summary (skip if near-duplicate)
-    context = subject
+    subj_clean = subject.rstrip(".!? ")
+    context = subj_clean
     if issue_summary:
         subj_norm = subject.lower().strip().rstrip(".")
         summ_norm = issue_summary.lower().strip().rstrip(".")
         if subj_norm not in summ_norm and summ_norm not in subj_norm:
-            context = f"{subject}. Issue: {issue_summary}"
+            context = f"{subj_clean}. Issue: {issue_summary}"
 
     # 2. Next step action
     if next_step == "Tag Ryan in ticket":
@@ -429,8 +436,9 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
             f'Can you review and action this?"'
         )
     elif next_step == "Slack Ryan ticket URL":
+        ticket_url = f"{TICKET_URL}{ticket_id}"
         parts.append(
-            f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} — {context}. '
+            f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} ({ticket_url}) — {context}. '
             f'Can you follow up?"'
         )
     # "Allow time to respond" — no Claude action; tag-only prompt is enough.
@@ -651,8 +659,12 @@ def write_report(rows: list[dict], output_path: str):
     ws.freeze_panes = f"A{HEADER_ROW + 1}"
 
     # ── Claude Prompts sheet (full-width, no truncation) ────────────────
-    prompt_rows = [r for r in sorted_rows if r.get("claude_prompt")]
-    if prompt_rows:
+    all_prompt_rows = [r for r in sorted_rows if r.get("claude_prompt")]
+    # Separate action prompts (Tag/Slack) from tag-only prompts (just esc/rarc)
+    action_prompts = [r for r in all_prompt_rows if r["next_step"] and
+                      r["next_step"] not in ("Allow time to respond", "")]
+    tag_only_prompts = [r for r in all_prompt_rows if r not in action_prompts]
+    if all_prompt_rows:
         ps = wb.create_sheet("Claude Prompts")
         p_headers = ["Ticket #", "Subject", "Next Step", "Claude Prompt"]
         p_widths  = [10, 36, 22, 90]
@@ -666,7 +678,8 @@ def write_report(rows: list[dict], output_path: str):
         ps.row_dimensions[1].height = 24
 
         pr = 2
-        for r in prompt_rows:
+        # Action prompts first (Tag Ryan / Slack Ryan)
+        for r in action_prompts:
             tid_cell = _cell(ps, pr, 1, r["ticket_id"], bold=True,
                              fc=LINK_COLOR, align="center")
             tid_cell.font = Font(name="Arial", bold=True, color=LINK_COLOR,
@@ -677,10 +690,41 @@ def write_report(rows: list[dict], output_path: str):
             _cell(ps, pr, 3, r["next_step"] or "—", wrap=True, size=10)
             _cell(ps, pr, 4, r["claude_prompt"], wrap=True, size=10)
 
-            # Dynamic row height based on prompt length
             chars = len(r["claude_prompt"])
             ps.row_dimensions[pr].height = max(36, min(100, chars // 2))
             pr += 1
+
+        # Batch tag-only prompts into a single row
+        if tag_only_prompts:
+            # Group by tag type
+            esc_ids = [str(r["ticket_id"]) for r in tag_only_prompts
+                       if r.get("tag") == "esc"]
+            rarc_ids = [str(r["ticket_id"]) for r in tag_only_prompts
+                        if r.get("tag") == "rarc"]
+            batch_parts = []
+            if esc_ids:
+                batch_parts.append(
+                    f'add the "esc" tag to tickets #{", #".join(esc_ids)}')
+            if rarc_ids:
+                batch_parts.append(
+                    f'add the "rarc" tag to tickets #{", #".join(rarc_ids)}')
+            if batch_parts:
+                batch_prompt = "Use the connected Zendesk tools. " + \
+                    ". Then ".join(
+                        [f"{p[0].upper()}{p[1:]}" if i == 0 else p
+                         for i, p in enumerate(batch_parts)])
+                pr += 1  # blank separator row
+                _cell(ps, pr, 1, "Batch", bold=True, fc=CSA_NAVY,
+                      align="center", size=10)
+                ticket_list = ", ".join(
+                    f"#{r['ticket_id']}" for r in tag_only_prompts)
+                _cell(ps, pr, 2, f"Tag-only: {ticket_list}",
+                      wrap=True, size=10)
+                _cell(ps, pr, 3, "Tag only", wrap=True, size=10,
+                      fc="999999")
+                _cell(ps, pr, 4, batch_prompt, wrap=True, size=10)
+                chars = len(batch_prompt)
+                ps.row_dimensions[pr].height = max(36, min(100, chars // 2))
 
         ps.freeze_panes = "A2"
 
