@@ -341,6 +341,29 @@ def classify_esc_rarc(ticket: dict, comments: list) -> str:
 
 RYAN_SLACK_HANDLE = "ryanbergsma"
 
+
+def _summarize_issue(description: str, max_len: int = 120) -> str:
+    """Extract a brief plain-text summary from a ticket description.
+
+    Strips HTML tags, collapses whitespace, and truncates to *max_len*
+    characters so the Claude prompt gives Ryan context about the original
+    request rather than SLA numbers.
+    """
+    if not description:
+        return ""
+    # Strip HTML tags
+    text = re.sub(r"<[^>]+>", " ", description)
+    # Decode common HTML entities
+    text = _html.unescape(text)
+    # Collapse whitespace, then fix space-before-punctuation
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    # Take the first sentence or max_len chars, whichever is shorter
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len].rsplit(" ", 1)[0]
+    return cut + "…" if cut else text[:max_len] + "…"
+
 # Follow-up date: 3 business days from now
 _follow_up = _now + timedelta(days=3)
 while _follow_up.weekday() >= 5:            # skip weekends
@@ -349,14 +372,14 @@ FOLLOW_UP_DATE = _follow_up.strftime("%Y-%m-%d")
 
 
 def build_claude_prompt(ticket_id: int, subject: str, tag: str,
-                        next_step: str, sla_display: str) -> str:
+                        next_step: str, issue_summary: str) -> str:
     """Build a copy-paste-ready Claude prompt for ticket automation.
 
     Each prompt:
       - Opens with 'Use the connected Zendesk tools.'
       - Uses 'First … Then …' for multi-step actions
       - Tags Ryan by @name in Zendesk notes, @handle in Slack DMs
-      - Includes specific context about what the requester needs
+      - Includes a brief summary of the original issue (not SLA numbers)
       - Replaces vague 'check back in 3 days' with a concrete date
     """
     ZD = "Use the connected Zendesk tools."
@@ -368,17 +391,22 @@ def build_claude_prompt(ticket_id: int, subject: str, tag: str,
     elif tag == "rarc":
         parts.append(f'add the "rarc" tag to ticket #{ticket_id}')
 
+    # Build context blurb: subject + issue summary
+    context = subject
+    if issue_summary and issue_summary.lower() != subject.lower():
+        context = f"{subject}. Issue: {issue_summary}"
+
     # 2. Next step action
     if next_step == "Tag Ryan in ticket":
         parts.append(
             f'add an internal note to ticket #{ticket_id}: '
-            f'"@Ryan Bergsma — {subject}. SLA: {sla_display}. '
+            f'"@Ryan Bergsma — {context}. '
             f'Can you review and action this?"'
         )
     elif next_step == "Slack Ryan ticket URL":
         parts.append(
-            f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} — {subject}. '
-            f'SLA: {sla_display}. Can you follow up?"'
+            f'DM @{RYAN_SLACK_HANDLE} in Slack: "Ticket #{ticket_id} — {context}. '
+            f'Can you follow up?"'
         )
     elif next_step == "Allow time to respond":
         parts.append(
@@ -574,18 +602,28 @@ def write_report(rows: list[dict], output_path: str):
               fc=sev["fc"] if val else CSA_DARK_TEXT,
               bg=sev["bg"] if val else bg, align="center")
 
-        # Col 8: Ryan
+        # Col 8: Ryan — status flag (Owner / Tagged Xd / —)
+        ryan_status = r.get("ryan_status", "")
         ryan_days = r["ryan_days_ago"]
-        if ryan_days is not None:
-            ryan_fc = (CSA_NAVY if ryan_days <= 3
-                       else "F57F17" if ryan_days <= 7
+        if ryan_status == "Owner":
+            ryan_text = "Owner"
+            if ryan_days is not None and ryan_days > 0:
+                ryan_text += f" (tagged {ryan_days}d)"
+            _cell(ws, cur_row, 8, ryan_text, bold=True, fc=CSA_BLUE,
+                  bg=bg, align="center")
+        elif ryan_status == "Tagged":
+            ryan_text = "Tagged"
+            if ryan_days is not None and ryan_days > 0:
+                ryan_text += f" ({ryan_days}d ago)"
+            elif ryan_days == 0:
+                ryan_text += " (today)"
+            ryan_fc = (CSA_NAVY if ryan_days is not None and ryan_days <= 3
+                       else "F57F17" if ryan_days is not None and ryan_days <= 7
                        else "B71C1C")
-            ryan_text = (f"{ryan_days}d ago ({r['ryan_date']})"
-                         if ryan_days > 0 else "Today")
             _cell(ws, cur_row, 8, ryan_text, bold=True, fc=ryan_fc,
                   bg=bg, align="center")
         else:
-            _cell(ws, cur_row, 8, "Never", fc="999999", bg=bg, align="center")
+            _cell(ws, cur_row, 8, "—", fc="999999", bg=bg, align="center")
 
         # Col 9: Next Step
         step = r["next_step"]
@@ -701,9 +739,22 @@ def main():
         # ESC/RARC classification
         tag = classify_esc_rarc(ticket, comments)
 
-        # Claude automation prompt
+        # Issue summary for Claude prompts (from ticket description)
         subject = ticket.get("subject", "")
-        claude_prompt = build_claude_prompt(tid, subject, tag, next_step, sla["display"])
+        description = ticket.get("description") or ""
+        issue_summary = _summarize_issue(description)
+
+        # Ryan status: Owner / Tagged / —
+        ryan_is_owner = ticket.get("assignee_id") == RYAN_ID
+        if ryan_is_owner:
+            ryan_status = "Owner"
+        elif ryan["found"]:
+            ryan_status = "Tagged"
+        else:
+            ryan_status = ""
+
+        # Claude automation prompt
+        claude_prompt = build_claude_prompt(tid, subject, tag, next_step, issue_summary)
 
         # Days open (business hours / 8)
         created_at = _parse_dt(ticket.get("created_at", ""))
@@ -727,6 +778,7 @@ def main():
             "ryan_found":    ryan["found"],
             "ryan_date":     ryan["date"],
             "ryan_days_ago": ryan["days_ago"],
+            "ryan_status":   ryan_status,
             "next_step":     next_step,
             "tag":           tag,
             "claude_prompt": claude_prompt,
